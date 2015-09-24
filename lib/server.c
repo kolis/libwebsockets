@@ -54,6 +54,10 @@ int lws_context_init_server(struct lws_context_creation_info *info,
 		return 1;
 	}
 
+
+	// Disabled for Windows build due to
+	// http://stackoverflow.com/questions/14388706/socket-options-so-reuseaddr-and-so-reuseport-how-do-they-differ-do-they-mean-t
+#ifndef _MSC_VER
 	/*
 	 * allow us to restart even if old sockets in TIME_WAIT
 	 */
@@ -62,6 +66,7 @@ int lws_context_init_server(struct lws_context_creation_info *info,
 		compatible_close(sockfd);
 		return 1;
 	}
+#endif
 
 	lws_plat_set_socket_options(context, sockfd);
 
