@@ -101,7 +101,7 @@ lws_issue_raw_ext_access(struct libwebsocket *wsi,
 	int ret;
 	struct lws_tokens eff_buf;
 	int m;
-	int n;
+	int n = 0;
 
 	eff_buf.token = (char *)buf;
 	eff_buf.token_len = len;
@@ -149,10 +149,9 @@ lws_issue_raw_ext_access(struct libwebsocket *wsi,
 				eff_buf.token_len = n;
 				len = n;
 			}
-
 		}
 
-		lwsl_parser("written %d bytes to client\n", eff_buf.token_len);
+		lwsl_parser("written %d bytes to client\n", n);
 
 		/* no extension has more to spill?  Then we can go */
 

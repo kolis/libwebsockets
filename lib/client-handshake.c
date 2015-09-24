@@ -12,7 +12,6 @@ struct libwebsocket *libwebsocket_client_connect_2(
 #endif
 	struct sockaddr_in server_addr4;
 	struct sockaddr_in client_addr4;
-	struct hostent *server_hostent;
 
 	struct sockaddr *v;
 	int n;
@@ -97,16 +96,37 @@ struct libwebsocket *libwebsocket_client_connect_2(
 	} else
 #endif
 	{
-		server_hostent = gethostbyname(ads);
-		if (!server_hostent) {
-			lwsl_err("Unable to get host name from %s\n", ads);
+		struct addrinfo ai, *res, *result;
+		void *p = NULL;
+
+		memset (&ai, 0, sizeof ai);
+		ai.ai_family = PF_UNSPEC;
+		ai.ai_socktype = SOCK_STREAM;
+		ai.ai_flags = AI_CANONNAME;
+
+		if (getaddrinfo(ads, NULL, &ai, &result))
+			goto oom4;
+
+		res = result;
+		while (!p && res) {
+			switch (res->ai_family) {
+			case AF_INET:
+				p = &((struct sockaddr_in *)res->ai_addr)->sin_addr;
+				break;
+			}
+
+			res = res->ai_next;
+		}
+		
+		if (!p) {
+			freeaddrinfo(result);
 			goto oom4;
 		}
 
 		server_addr4.sin_family = AF_INET;
-		server_addr4.sin_addr =
-				*((struct in_addr *)server_hostent->h_addr);
+		server_addr4.sin_addr = *((struct in_addr *)p);
 		bzero(&server_addr4.sin_zero, 8);
+		freeaddrinfo(result);
 	}
 
 	if (wsi->sock < 0) {
@@ -131,6 +151,7 @@ struct libwebsocket *libwebsocket_client_connect_2(
 
 		wsi->mode = LWS_CONNMODE_WS_CLIENT_WAITING_CONNECT;
 
+		lws_libev_accept(context, wsi, wsi->sock);
 		insert_wsi_socket_into_fds(context, wsi);
 
 		libwebsocket_set_timeout(wsi,
@@ -192,6 +213,7 @@ struct libwebsocket *libwebsocket_client_connect_2(
 			 */
 			if (lws_change_pollfd(wsi, 0, LWS_POLLOUT))
 				goto oom4;
+			lws_libev_io(context, wsi, LWS_EV_START | LWS_EV_WRITE);
 
 			return wsi;
 		}
@@ -262,8 +284,8 @@ struct libwebsocket *libwebsocket_client_connect_2(
 	return wsi;
 
 oom4:
-	free(wsi->u.hdr.ah);
-	free(wsi);
+	lws_free(wsi->u.hdr.ah);
+	lws_free(wsi);
 	return NULL;
 
 failed:
@@ -284,7 +306,8 @@ failed:
  * @origin:	Socket origin name
  * @protocol:	Comma-separated list of protocols being asked for from
  *		the server, or just one.  The server will pick the one it
- *		likes best.
+ *		likes best.  If you don't want to specify a protocol, which is
+ *		legal, use NULL here.
  * @ietf_version_or_minus_one: -1 to ask to connect using the default, latest
  *		protocol supported, or the specific protocol ordinal
  *
@@ -304,11 +327,10 @@ libwebsocket_client_connect(struct libwebsocket_context *context,
 {
 	struct libwebsocket *wsi;
 
-	wsi = (struct libwebsocket *) malloc(sizeof(struct libwebsocket));
+	wsi = lws_zalloc(sizeof(struct libwebsocket));
 	if (wsi == NULL)
 		goto bail;
 
-	memset(wsi, 0, sizeof(*wsi));
 	wsi->sock = -1;
 
 	/* -1 means just use latest supported */
@@ -389,9 +411,9 @@ libwebsocket_client_connect(struct libwebsocket_context *context,
        return libwebsocket_client_connect_2(context, wsi);
 
 bail1:
-	free(wsi->u.hdr.ah);
+	lws_free(wsi->u.hdr.ah);
 bail:
-	free(wsi);
+	lws_free(wsi);
 
 	return NULL;
 }
@@ -434,8 +456,10 @@ libwebsocket_client_connect_extended(struct libwebsocket_context *context,
 			ssl_connection, path, host, origin, protocol,
 						     ietf_version_or_minus_one);
 
-	if (ws && !ws->user_space && userdata)
+	if (ws && !ws->user_space && userdata) {
+		ws->user_space_externally_allocated = 1;
 		ws->user_space = userdata ;
+	}
 
 	return ws ;
 }

@@ -42,6 +42,10 @@ int lextable_decode(int pos, char c)
 				return -1;
 			return pos;
 		}
+
+		if (lextable[pos] == FAIL_CHAR)
+			return -1;
+
 		/* b7 = 0, end or 3-byte */
 		if (lextable[pos] < FAIL_CHAR) /* terminal marker */
 			return pos;
@@ -57,7 +61,9 @@ int lextable_decode(int pos, char c)
 
 int lws_allocate_header_table(struct libwebsocket *wsi)
 {
-	wsi->u.hdr.ah = malloc(sizeof(*wsi->u.hdr.ah));
+	/* Be sure to free any existing header data to avoid mem leak: */
+	lws_free_header_table(wsi);
+	wsi->u.hdr.ah = lws_malloc(sizeof(*wsi->u.hdr.ah));
 	if (wsi->u.hdr.ah == NULL) {
 		lwsl_err("Out of memory\n");
 		return -1;
@@ -68,6 +74,13 @@ int lws_allocate_header_table(struct libwebsocket *wsi)
 
 	return 0;
 }
+
+int lws_free_header_table(struct libwebsocket *wsi)
+{
+	lws_free2(wsi->u.hdr.ah);
+	wsi->u.hdr.ah = NULL;
+	return 0;
+};
 
 LWS_VISIBLE int lws_hdr_total_length(struct libwebsocket *wsi, enum lws_token_indexes h)
 {
@@ -151,7 +164,7 @@ int lws_hdr_simple_create(struct libwebsocket *wsi,
 	return 0;
 }
 
-static char char_to_hex(const char c)
+static signed char char_to_hex(const char c)
 {
 	if (c >= '0' && c <= '9')
 		return c - '0';
@@ -171,6 +184,13 @@ static int issue_char(struct libwebsocket *wsi, unsigned char c)
 		lwsl_warn("excessive header content\n");
 		return -1;
 	}
+
+	if( wsi->u.hdr.ah->frags[wsi->u.hdr.ah->next_frag_index].len >= 
+		wsi->u.hdr.current_token_limit) {
+		lwsl_warn("header %i exceeds limit\n", wsi->u.hdr.parser_state);
+		return 1;
+	};
+
 	wsi->u.hdr.ah->data[wsi->u.hdr.ah->pos++] = c;
 	if (c)
 		wsi->u.hdr.ah->frags[wsi->u.hdr.ah->next_frag_index].len++;
@@ -178,43 +198,22 @@ static int issue_char(struct libwebsocket *wsi, unsigned char c)
 	return 0;
 }
 
-int libwebsocket_parse(struct libwebsocket *wsi, unsigned char c)
+int libwebsocket_parse(
+		struct libwebsocket_context *context,
+		struct libwebsocket *wsi, unsigned char c)
 {
-	int n;
+	static const unsigned char methods[] = {
+		WSI_TOKEN_GET_URI,
+		WSI_TOKEN_POST_URI,
+		WSI_TOKEN_OPTIONS_URI,
+		WSI_TOKEN_PUT_URI,
+		WSI_TOKEN_PATCH_URI,
+		WSI_TOKEN_DELETE_URI,
+	};
+	int n, m;
 
 	switch (wsi->u.hdr.parser_state) {
-	case WSI_TOKEN_GET_URI:
-	case WSI_TOKEN_POST_URI:
-	case WSI_TOKEN_HOST:
-	case WSI_TOKEN_CONNECTION:
-	case WSI_TOKEN_KEY1:
-	case WSI_TOKEN_KEY2:
-	case WSI_TOKEN_PROTOCOL:
-	case WSI_TOKEN_UPGRADE:
-	case WSI_TOKEN_ORIGIN:
-	case WSI_TOKEN_SWORIGIN:
-	case WSI_TOKEN_DRAFT:
-	case WSI_TOKEN_CHALLENGE:
-	case WSI_TOKEN_KEY:
-	case WSI_TOKEN_VERSION:
-	case WSI_TOKEN_ACCEPT:
-	case WSI_TOKEN_NONCE:
-	case WSI_TOKEN_EXTENSIONS:
-	case WSI_TOKEN_HTTP:
-	case WSI_TOKEN_HTTP_ACCEPT:
-	case WSI_TOKEN_HTTP_IF_MODIFIED_SINCE:
-	case WSI_TOKEN_HTTP_ACCEPT_ENCODING:
-	case WSI_TOKEN_HTTP_ACCEPT_LANGUAGE:
-	case WSI_TOKEN_HTTP_PRAGMA:
-	case WSI_TOKEN_HTTP_CACHE_CONTROL:
-	case WSI_TOKEN_HTTP_AUTHORIZATION:
-	case WSI_TOKEN_HTTP_COOKIE:
-	case WSI_TOKEN_HTTP_CONTENT_LENGTH:
-	case WSI_TOKEN_HTTP_CONTENT_TYPE:
-	case WSI_TOKEN_HTTP_DATE:
-	case WSI_TOKEN_HTTP_RANGE:
-	case WSI_TOKEN_HTTP_REFERER:
-
+	default:
 
 		lwsl_parser("WSI_TOK_(%d) '%c'\n", wsi->u.hdr.parser_state, c);
 
@@ -224,7 +223,11 @@ int libwebsocket_parse(struct libwebsocket *wsi, unsigned char c)
 				      wsi->u.hdr.parser_state]].len && c == ' ')
 			break;
 
-		if ((wsi->u.hdr.parser_state != WSI_TOKEN_GET_URI) && (wsi->u.hdr.parser_state != WSI_TOKEN_POST_URI))
+		for (m = 0; m < ARRAY_SIZE(methods); m++)
+			if (wsi->u.hdr.parser_state == methods[m])
+				break;
+		if (m == ARRAY_SIZE(methods))
+			/* it was not any of the methods */
 			goto check_eol;
 
 		/* special URI processing... end at space */
@@ -234,9 +237,12 @@ int libwebsocket_parse(struct libwebsocket *wsi, unsigned char c)
 			if (!wsi->u.hdr.ah->frags[wsi->u.hdr.ah->next_frag_index].len)
 				if (issue_char(wsi, '/') < 0)
 					return -1;
-			c = '\0';
-			wsi->u.hdr.parser_state = WSI_TOKEN_SKIPPING;
-			goto spill;
+
+			/* begin parsing HTTP version: */
+			if (issue_char(wsi, '\0') < 0)
+				return -1;
+			wsi->u.hdr.parser_state = WSI_TOKEN_HTTP;
+			goto start_fragment;
 		}
 
 		/* special URI processing... convert %xx */
@@ -267,7 +273,7 @@ int libwebsocket_parse(struct libwebsocket *wsi, unsigned char c)
 				issue_char(wsi, '%');
 				wsi->u.hdr.ues = URIES_IDLE;
 				/* regurgitate + assess */
-				if (libwebsocket_parse(wsi, wsi->u.hdr.esc_stash) < 0)
+				if (libwebsocket_parse(context, wsi, wsi->u.hdr.esc_stash) < 0)
 					return -1;
 				/* continue on to assess c */
 				break;
@@ -300,8 +306,8 @@ int libwebsocket_parse(struct libwebsocket *wsi, unsigned char c)
 			if (c == '.') {
 				wsi->u.hdr.ups = URIPS_SEEN_SLASH_DOT;
 				goto swallow;
-			} else
-				wsi->u.hdr.ups = URIPS_IDLE;
+			}
+			wsi->u.hdr.ups = URIPS_IDLE;
 			break;
 		case URIPS_SEEN_SLASH_DOT:
 			/* swallow second . */
@@ -340,22 +346,12 @@ int libwebsocket_parse(struct libwebsocket *wsi, unsigned char c)
 			/* last issued was /, so another / == // */
 			if (c == '/')
 				goto swallow;
-			else /* last we issued was / so SEEN_SLASH */
-				wsi->u.hdr.ups = URIPS_SEEN_SLASH;
+			/* last we issued was / so SEEN_SLASH */
+			wsi->u.hdr.ups = URIPS_SEEN_SLASH;
 			break;
 		case URIPS_ARGUMENTS:
 			/* leave them alone */
 			break;
-		}
-
-check_eol:
-
-		/* bail at EOL */
-		if (wsi->u.hdr.parser_state != WSI_TOKEN_CHALLENGE &&
-								  c == '\x0d') {
-			c = '\0';
-			wsi->u.hdr.parser_state = WSI_TOKEN_SKIPPING_SAW_CR;
-			lwsl_parser("*\n");
 		}
 
 		if (c == '?') { /* start of URI arguments */
@@ -380,9 +376,22 @@ check_eol:
 			goto swallow;
 		}
 
-spill:
-		if (issue_char(wsi, c) < 0)
+check_eol:
+
+		/* bail at EOL */
+		if (wsi->u.hdr.parser_state != WSI_TOKEN_CHALLENGE &&
+								  c == '\x0d') {
+			c = '\0';
+			wsi->u.hdr.parser_state = WSI_TOKEN_SKIPPING_SAW_CR;
+			lwsl_parser("*\n");
+		}
+
+		n = issue_char(wsi, c);
+		if (n < 0)
 			return -1;
+		if (n > 0)
+			wsi->u.hdr.parser_state = WSI_TOKEN_SKIPPING;
+
 swallow:
 		/* per-protocol end of headers management */
 
@@ -392,47 +401,58 @@ swallow:
 
 		/* collecting and checking a name part */
 	case WSI_TOKEN_NAME_PART:
-		lwsl_parser("WSI_TOKEN_NAME_PART '%c'\n", c);
+		lwsl_parser("WSI_TOKEN_NAME_PART '%c' (mode=%d)\n", c, wsi->mode);
 
 		wsi->u.hdr.lextable_pos =
 				lextable_decode(wsi->u.hdr.lextable_pos, c);
-
-		if (wsi->u.hdr.lextable_pos < 0) {
+		/*
+		 * Server needs to look out for unknown methods...
+		 */
+		if (wsi->u.hdr.lextable_pos < 0 &&
+		    wsi->mode == LWS_CONNMODE_HTTP_SERVING) {
 			/* this is not a header we know about */
-			if (wsi->u.hdr.ah->frag_index[WSI_TOKEN_GET_URI] || wsi->u.hdr.ah->frag_index[WSI_TOKEN_POST_URI] ||
-				    wsi->u.hdr.ah->frag_index[WSI_TOKEN_HTTP]) {
-				/*
-				 * altready had the method, no idea what
-				 * this crap is, ignore
-				 */
-				wsi->u.hdr.parser_state = WSI_TOKEN_SKIPPING;
-				break;
-			}
+			for (m = 0; m < ARRAY_SIZE(methods); m++)
+				if (wsi->u.hdr.ah->frag_index[methods[m]]) {
+					/*
+					 * already had the method, no idea what
+					 * this crap from the client is, ignore
+					 */
+					wsi->u.hdr.parser_state = WSI_TOKEN_SKIPPING;
+					break;
+				}
 			/*
-			 * hm it's an unknown http method in fact,
+			 * hm it's an unknown http method from a client in fact,
 			 * treat as dangerous
 			 */
-
-			lwsl_info("Unknown method - dropping\n");
-			return -1;
-		}
-		if (lextable[wsi->u.hdr.lextable_pos] < FAIL_CHAR) {
-
-			/* terminal state */
-
-			n = (lextable[wsi->u.hdr.lextable_pos] << 8) | lextable[wsi->u.hdr.lextable_pos + 1];
-
-			lwsl_parser("known hdr %d\n", n);
-
-			if (n == WSI_TOKEN_GET_URI &&
-				wsi->u.hdr.ah->frag_index[WSI_TOKEN_GET_URI]) {
-				lwsl_warn("Duplicated GET\n");
-				return -1;
-			} else if (n == WSI_TOKEN_POST_URI &&
-				wsi->u.hdr.ah->frag_index[WSI_TOKEN_POST_URI]) {
-				lwsl_warn("Duplicated POST\n");
+			if (m == ARRAY_SIZE(methods)) {
+				lwsl_info("Unknown method - dropping\n");
 				return -1;
 			}
+			break;
+		}
+		/*
+		 * ...otherwise for a client, let him ignore unknown headers
+		 * coming from the server
+		 */
+		if (wsi->u.hdr.lextable_pos < 0) {
+			wsi->u.hdr.parser_state = WSI_TOKEN_SKIPPING;
+			break;
+		}
+
+		if (lextable[wsi->u.hdr.lextable_pos] < FAIL_CHAR) {
+			/* terminal state */
+
+			n = ((unsigned int)lextable[wsi->u.hdr.lextable_pos] << 8) |
+					lextable[wsi->u.hdr.lextable_pos + 1];
+
+			lwsl_parser("known hdr %d\n", n);
+			for (m = 0; m < ARRAY_SIZE(methods); m++)
+				if (n == methods[m] &&
+						wsi->u.hdr.ah->frag_index[
+							methods[m]]) {
+					lwsl_warn("Duplicated method\n");
+					return -1;
+				}
 
 			/*
 			 * WSORIGIN is protocol equiv to ORIGIN,
@@ -443,6 +463,13 @@ swallow:
 
 			wsi->u.hdr.parser_state = (enum lws_token_indexes)
 							(WSI_TOKEN_GET_URI + n);
+
+			if (context->token_limits)
+				wsi->u.hdr.current_token_limit =
+					context->token_limits->token_limit[wsi->u.hdr.parser_state];
+			else
+				wsi->u.hdr.current_token_limit = sizeof(wsi->u.hdr.ah->data);
+
 			if (wsi->u.hdr.parser_state == WSI_TOKEN_CHALLENGE)
 				goto set_parsing_complete;
 
@@ -507,9 +534,6 @@ start_fragment:
 	case WSI_PARSING_COMPLETE:
 		lwsl_parser("WSI_PARSING_COMPLETE '%c'\n", c);
 		break;
-
-	default:	/* keep gcc happy */
-		break;
 	}
 
 	return 0;
@@ -548,7 +572,6 @@ LWS_VISIBLE int lws_frame_is_binary(struct libwebsocket *wsi)
 int
 libwebsocket_rx_sm(struct libwebsocket *wsi, unsigned char c)
 {
-	int n;
 	struct lws_tokens eff_buf;
 	int ret = 0;
 
@@ -791,8 +814,10 @@ handle_first:
 
 	case LWS_RXPS_PAYLOAD_UNTIL_LENGTH_EXHAUSTED:
 
-		if (!wsi->u.ws.rx_user_buffer)
+		if (!wsi->u.ws.rx_user_buffer) {
 			lwsl_err("NULL user buffer...\n");
+			return 1;
+		}
 
 		if (wsi->u.ws.all_zero_nonce)
 			wsi->u.ws.rx_user_buffer[LWS_SEND_BUFFER_PRE_PADDING +
@@ -844,32 +869,59 @@ spill:
 				lwsl_parser("seen client close ack\n");
 				return -1;
 			}
+			if (wsi->state == WSI_STATE_RETURNED_CLOSE_ALREADY)
+				/* if he sends us 2 CLOSE, kill him */
+				return -1;
+
 			lwsl_parser("server sees client close packet\n");
-			/* parrot the close packet payload back */
-			n = libwebsocket_write(wsi, (unsigned char *)
-				&wsi->u.ws.rx_user_buffer[
-					LWS_SEND_BUFFER_PRE_PADDING],
-					wsi->u.ws.rx_user_buffer_head,
-							       LWS_WRITE_CLOSE);
-			if (n < 0)
-				lwsl_info("write of close ack failed %d\n", n);
 			wsi->state = WSI_STATE_RETURNED_CLOSE_ALREADY;
-			/* close the connection */
-			return -1;
+			/* deal with the close packet contents as a PONG */
+			wsi->u.ws.payload_is_close = 1;
+			goto process_as_ping;
 
 		case LWS_WS_OPCODE_07__PING:
 			lwsl_info("received %d byte ping, sending pong\n",
 						 wsi->u.ws.rx_user_buffer_head);
-			lwsl_hexdump(&wsi->u.ws.rx_user_buffer[
-					LWS_SEND_BUFFER_PRE_PADDING],
-						 wsi->u.ws.rx_user_buffer_head);
-			/* parrot the ping packet payload back as a pong */
-			n = libwebsocket_write(wsi, (unsigned char *)
-			&wsi->u.ws.rx_user_buffer[LWS_SEND_BUFFER_PRE_PADDING],
-				 wsi->u.ws.rx_user_buffer_head, LWS_WRITE_PONG);
-			if (n < 0)
-				return -1;
-			/* ... then just drop it */
+
+			if (wsi->u.ws.ping_pending_flag) {
+				/* 
+				 * there is already a pending ping payload
+				 * we should just log and drop
+				 */
+				lwsl_parser("DROP PING since one pending\n");
+				goto ping_drop;
+			}
+process_as_ping:
+			/* control packets can only be < 128 bytes long */
+			if (wsi->u.ws.rx_user_buffer_head > 128 - 4) {
+				lwsl_parser("DROP PING payload too large\n");
+				goto ping_drop;
+			}
+			
+			/* if existing buffer is too small, drop it */
+			if (wsi->u.ws.ping_payload_buf &&
+			    wsi->u.ws.ping_payload_alloc < wsi->u.ws.rx_user_buffer_head) {
+				lws_free2(wsi->u.ws.ping_payload_buf);
+			}
+
+			/* if no buffer, allocate it */
+			if (!wsi->u.ws.ping_payload_buf) {
+				wsi->u.ws.ping_payload_buf = lws_malloc(wsi->u.ws.rx_user_buffer_head
+									+ LWS_SEND_BUFFER_PRE_PADDING);
+				wsi->u.ws.ping_payload_alloc = wsi->u.ws.rx_user_buffer_head;
+			}
+			
+			/* stash the pong payload */
+			memcpy(wsi->u.ws.ping_payload_buf + LWS_SEND_BUFFER_PRE_PADDING,
+			       &wsi->u.ws.rx_user_buffer[LWS_SEND_BUFFER_PRE_PADDING],
+				wsi->u.ws.rx_user_buffer_head);
+			
+			wsi->u.ws.ping_payload_len = wsi->u.ws.rx_user_buffer_head;
+			wsi->u.ws.ping_pending_flag = 1;
+			
+			/* get it sent as soon as possible */
+			libwebsocket_callback_on_writable(wsi->protocol->owning_server, wsi);
+ping_drop:
 			wsi->u.ws.rx_user_buffer_head = 0;
 			return 0;
 

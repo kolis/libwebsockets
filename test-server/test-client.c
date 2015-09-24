@@ -31,9 +31,7 @@
 #include <unistd.h>
 #endif
 
-#ifdef CMAKE_BUILD
 #include "lws_config.h"
-#endif
 
 #include "../lib/libwebsockets.h"
 
@@ -137,6 +135,7 @@ callback_lws_mirror(struct libwebsocket_context *context,
 						  LWS_SEND_BUFFER_POST_PADDING];
 	int l = 0;
 	int n;
+	unsigned int rands[4];
 
 	switch (reason) {
 
@@ -144,7 +143,8 @@ callback_lws_mirror(struct libwebsocket_context *context,
 
 		fprintf(stderr, "callback_lws_mirror: LWS_CALLBACK_CLIENT_ESTABLISHED\n");
 
-		mirror_lifetime = 10 + (random() & 1023);
+		libwebsockets_get_random(context, rands, sizeof(rands[0]));
+		mirror_lifetime = 10 + (rands[0] & 1023);
 		/* useful to test single connection stability */
 		if (longlived)
 			mirror_lifetime += 50000;
@@ -178,13 +178,15 @@ callback_lws_mirror(struct libwebsocket_context *context,
 
 	case LWS_CALLBACK_CLIENT_WRITEABLE:
 
-		for (n = 0; n < 1; n++)
+		for (n = 0; n < 1; n++) {
+			libwebsockets_get_random(context, rands, sizeof(rands));
 			l += sprintf((char *)&buf[LWS_SEND_BUFFER_PRE_PADDING + l],
 					"c #%06X %d %d %d;",
-					(int)random() & 0xffffff,
-					(int)random() % 500,
-					(int)random() % 250,
-					(int)random() % 24);
+					(int)rands[0] & 0xffffff,
+					(int)rands[1] % 500,
+					(int)rands[2] % 250,
+					(int)rands[3] % 24);
+		}
 
 		n = libwebsocket_write(wsi,
 		   &buf[LWS_SEND_BUFFER_PRE_PADDING], l, opts | LWS_WRITE_TEXT);
@@ -217,13 +219,13 @@ callback_lws_mirror(struct libwebsocket_context *context,
 
 static struct libwebsocket_protocols protocols[] = {
 	{
-		"dumb-increment-protocol",
+		"dumb-increment-protocol,fake-nonexistant-protocol",
 		callback_dumb_increment,
 		0,
 		20,
 	},
 	{
-		"lws-mirror-protocol",
+		"fake-nonexistant-protocol,lws-mirror-protocol",
 		callback_lws_mirror,
 		0,
 		128,
@@ -264,7 +266,7 @@ int main(int argc, char **argv)
 	memset(&info, 0, sizeof info);
 
 	fprintf(stderr, "libwebsockets test client\n"
-			"(C) Copyright 2010-2013 Andy Green <andy@warmcat.com> "
+			"(C) Copyright 2010-2015 Andy Green <andy@warmcat.com> "
 						    "licensed under LGPL2.1\n");
 
 	if (argc < 2)
