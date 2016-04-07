@@ -21,27 +21,121 @@
 
 #include "private-libwebsockets.h"
 
-int libwebsocket_client_rx_sm(struct libwebsocket *wsi, unsigned char c)
+int lws_client_rx_sm(struct lws *wsi, unsigned char c)
 {
+	struct lws_context_per_thread *pt = &wsi->context->pt[(int)wsi->tsi];
 	int callback_action = LWS_CALLBACK_CLIENT_RECEIVE;
-	int handled;
+	int handled, n, m, rx_draining_ext = 0;
+	unsigned short close_code;
 	struct lws_tokens eff_buf;
-	int m;
+	unsigned char *pp;
+
+	if (wsi->u.ws.rx_draining_ext) {
+		struct lws **w = &pt->rx_draining_ext_list;
+		lwsl_ext("%s: RX EXT DRAINING: Removing from list\n", __func__, c);
+		assert(!c);
+		eff_buf.token = NULL;
+		eff_buf.token_len = 0;
+		wsi->u.ws.rx_draining_ext = 0;
+		/* remove us from context draining ext list */
+		while (*w) {
+			if (*w == wsi) {
+				*w = wsi->u.ws.rx_draining_ext_list;
+				break;
+			}
+			w = &((*w)->u.ws.rx_draining_ext_list);
+		}
+		wsi->u.ws.rx_draining_ext_list = NULL;
+		rx_draining_ext = 1;
+
+		goto drain_extension;
+	}
 
 	switch (wsi->lws_rx_parse_state) {
 	case LWS_RXPS_NEW:
+		/* control frames (PING) may interrupt checkable sequences */
+		wsi->u.ws.defeat_check_utf8 = 0;
 
 		switch (wsi->ietf_spec_revision) {
-
 		case 13:
 			wsi->u.ws.opcode = c & 0xf;
-			wsi->u.ws.rsv = (c & 0x70);
-			wsi->u.ws.final = !!((c >> 7) & 1);
+			/* revisit if an extension wants them... */
 			switch (wsi->u.ws.opcode) {
-			case LWS_WS_OPCODE_07__TEXT_FRAME:
-			case LWS_WS_OPCODE_07__BINARY_FRAME:
+			case LWSWSOPC_TEXT_FRAME:
+				wsi->u.ws.rsv_first_msg = (c & 0x70);
+				wsi->u.ws.continuation_possible = 1;
+				wsi->u.ws.check_utf8 = lws_check_opt(
+					wsi->context->options,
+					LWS_SERVER_OPTION_VALIDATE_UTF8);
+				wsi->u.ws.utf8 = 0;
+				break;
+			case LWSWSOPC_BINARY_FRAME:
+				wsi->u.ws.rsv_first_msg = (c & 0x70);
+				wsi->u.ws.check_utf8 = 0;
+				wsi->u.ws.continuation_possible = 1;
+				break;
+			case LWSWSOPC_CONTINUATION:
+				if (!wsi->u.ws.continuation_possible) {
+					lwsl_info("disordered continuation\n");
+					return -1;
+				}
+				break;
+			case LWSWSOPC_CLOSE:
+				wsi->u.ws.check_utf8 = 0;
+				wsi->u.ws.utf8 = 0;
+				break;
+			case 3:
+			case 4:
+			case 5:
+			case 6:
+			case 7:
+			case 0xb:
+			case 0xc:
+			case 0xd:
+			case 0xe:
+			case 0xf:
+				lwsl_info("illegal opcode\n");
+				return -1;
+			default:
+				wsi->u.ws.defeat_check_utf8 = 1;
+				break;
+			}
+			wsi->u.ws.rsv = (c & 0x70);
+			/* revisit if an extension wants them... */
+			if (
+#ifndef LWS_NO_EXTENSIONS
+				!wsi->count_act_ext &&
+#endif
+				wsi->u.ws.rsv) {
+				lwsl_info("illegal rsv bits set\n");
+				return -1;
+			}
+			wsi->u.ws.final = !!((c >> 7) & 1);
+			lwsl_ext("%s:    This RX frame Final %d\n", __func__, wsi->u.ws.final);
+
+			if (wsi->u.ws.owed_a_fin &&
+			    (wsi->u.ws.opcode == LWSWSOPC_TEXT_FRAME ||
+			     wsi->u.ws.opcode == LWSWSOPC_BINARY_FRAME)) {
+				lwsl_info("hey you owed us a FIN\n");
+				return -1;
+			}
+			if ((!(wsi->u.ws.opcode & 8)) && wsi->u.ws.final) {
+				wsi->u.ws.continuation_possible = 0;
+				wsi->u.ws.owed_a_fin = 0;
+			}
+
+			if ((wsi->u.ws.opcode & 8) && !wsi->u.ws.final) {
+				lwsl_info("control message cannot be fragmented\n");
+				return -1;
+			}
+			if (!wsi->u.ws.final)
+				wsi->u.ws.owed_a_fin = 1;
+
+			switch (wsi->u.ws.opcode) {
+			case LWSWSOPC_TEXT_FRAME:
+			case LWSWSOPC_BINARY_FRAME:
 				wsi->u.ws.frame_is_binary = wsi->u.ws.opcode ==
-						 LWS_WS_OPCODE_07__BINARY_FRAME;
+						 LWSWSOPC_BINARY_FRAME;
 				break;
 			}
 			wsi->lws_rx_parse_state = LWS_RXPS_04_FRAME_HDR_LEN;
@@ -53,7 +147,6 @@ int libwebsocket_client_rx_sm(struct libwebsocket *wsi, unsigned char c)
 			break;
 		}
 		break;
-
 
 	case LWS_RXPS_04_FRAME_HDR_LEN:
 
@@ -98,8 +191,7 @@ int libwebsocket_client_rx_sm(struct libwebsocket *wsi, unsigned char c)
 	case LWS_RXPS_04_FRAME_HDR_LEN16_1:
 		wsi->u.ws.rx_packet_length |= c;
 		if (wsi->u.ws.this_frame_masked)
-			wsi->lws_rx_parse_state =
-					LWS_RXPS_07_COLLECT_FRAME_KEY_1;
+			wsi->lws_rx_parse_state = LWS_RXPS_07_COLLECT_FRAME_KEY_1;
 		else {
 			if (wsi->u.ws.rx_packet_length)
 				wsi->lws_rx_parse_state =
@@ -178,28 +270,28 @@ int libwebsocket_client_rx_sm(struct libwebsocket *wsi, unsigned char c)
 		break;
 
 	case LWS_RXPS_07_COLLECT_FRAME_KEY_1:
-		wsi->u.ws.frame_masking_nonce_04[0] = c;
+		wsi->u.ws.mask[0] = c;
 		if (c)
 			wsi->u.ws.all_zero_nonce = 0;
 		wsi->lws_rx_parse_state = LWS_RXPS_07_COLLECT_FRAME_KEY_2;
 		break;
 
 	case LWS_RXPS_07_COLLECT_FRAME_KEY_2:
-		wsi->u.ws.frame_masking_nonce_04[1] = c;
+		wsi->u.ws.mask[1] = c;
 		if (c)
 			wsi->u.ws.all_zero_nonce = 0;
 		wsi->lws_rx_parse_state = LWS_RXPS_07_COLLECT_FRAME_KEY_3;
 		break;
 
 	case LWS_RXPS_07_COLLECT_FRAME_KEY_3:
-		wsi->u.ws.frame_masking_nonce_04[2] = c;
+		wsi->u.ws.mask[2] = c;
 		if (c)
 			wsi->u.ws.all_zero_nonce = 0;
 		wsi->lws_rx_parse_state = LWS_RXPS_07_COLLECT_FRAME_KEY_4;
 		break;
 
 	case LWS_RXPS_07_COLLECT_FRAME_KEY_4:
-		wsi->u.ws.frame_masking_nonce_04[3] = c;
+		wsi->u.ws.mask[3] = c;
 		if (c)
 			wsi->u.ws.all_zero_nonce = 0;
 
@@ -214,19 +306,12 @@ int libwebsocket_client_rx_sm(struct libwebsocket *wsi, unsigned char c)
 
 	case LWS_RXPS_PAYLOAD_UNTIL_LENGTH_EXHAUSTED:
 
-		if (!wsi->u.ws.rx_user_buffer) {
-			lwsl_err("NULL client rx_user_buffer\n");
-			return 1;
-		}
+		assert(wsi->u.ws.rx_ubuf);
 
-		if ((!wsi->u.ws.this_frame_masked) || wsi->u.ws.all_zero_nonce)
-			wsi->u.ws.rx_user_buffer[LWS_SEND_BUFFER_PRE_PADDING +
-			       (wsi->u.ws.rx_user_buffer_head++)] = c;
-		else
-			wsi->u.ws.rx_user_buffer[LWS_SEND_BUFFER_PRE_PADDING +
-			       (wsi->u.ws.rx_user_buffer_head++)] =
-			c ^ wsi->u.ws.frame_masking_nonce_04[
-					    (wsi->u.ws.frame_mask_index++) & 3];
+		if (wsi->u.ws.this_frame_masked && !wsi->u.ws.all_zero_nonce)
+			c ^= wsi->u.ws.mask[(wsi->u.ws.mask_idx++) & 3];
+
+		wsi->u.ws.rx_ubuf[LWS_PRE + (wsi->u.ws.rx_ubuf_head++)] = c;
 
 		if (--wsi->u.ws.rx_packet_length == 0) {
 			/* spill because we have the whole frame */
@@ -238,15 +323,12 @@ int libwebsocket_client_rx_sm(struct libwebsocket *wsi, unsigned char c)
 		 * if there's no protocol max frame size given, we are
 		 * supposed to default to LWS_MAX_SOCKET_IO_BUF
 		 */
-
 		if (!wsi->protocol->rx_buffer_size &&
-			 		wsi->u.ws.rx_user_buffer_head !=
-			 				  LWS_MAX_SOCKET_IO_BUF)
+		    wsi->u.ws.rx_ubuf_head != LWS_MAX_SOCKET_IO_BUF)
 			break;
-		else
-			if (wsi->protocol->rx_buffer_size &&
-					wsi->u.ws.rx_user_buffer_head !=
-						  wsi->protocol->rx_buffer_size)
+
+		if (wsi->protocol->rx_buffer_size &&
+		    wsi->u.ws.rx_ubuf_head != wsi->protocol->rx_buffer_size)
 			break;
 
 		/* spill because we filled our rx buffer */
@@ -260,9 +342,17 @@ spill:
 		 */
 
 		switch (wsi->u.ws.opcode) {
-		case LWS_WS_OPCODE_07__CLOSE:
+		case LWSWSOPC_CLOSE:
+			pp = (unsigned char *)&wsi->u.ws.rx_ubuf[LWS_PRE];
+			if (lws_check_opt(wsi->context->options,
+					  LWS_SERVER_OPTION_VALIDATE_UTF8) &&
+			    wsi->u.ws.rx_ubuf_head > 2 &&
+			    lws_check_utf8(&wsi->u.ws.utf8, pp + 2,
+					   wsi->u.ws.rx_ubuf_head - 2))
+				goto utf8_fail;
+
 			/* is this an acknowledgement of our close? */
-			if (wsi->state == WSI_STATE_AWAITING_CLOSE_ACK) {
+			if (wsi->state == LWSS_AWAITING_CLOSE_ACK) {
 				/*
 				 * fine he has told us he is closing too, let's
 				 * finish our close
@@ -270,24 +360,45 @@ spill:
 				lwsl_parser("seen server's close ack\n");
 				return -1;
 			}
+
 			lwsl_parser("client sees server close len = %d\n",
-						 wsi->u.ws.rx_user_buffer_head);
+						 wsi->u.ws.rx_ubuf_head);
+			if (wsi->u.ws.rx_ubuf_head >= 2) {
+				close_code = (pp[0] << 8) | pp[1];
+				if (close_code < 1000 || close_code == 1004 ||
+				    close_code == 1005 || close_code == 1006 ||
+				    close_code == 1012 || close_code == 1013 ||
+				    close_code == 1014 || close_code == 1015 ||
+				    (close_code >= 1016 && close_code < 3000)
+				) {
+					pp[0] = (LWS_CLOSE_STATUS_PROTOCOL_ERR >> 8) & 0xff;
+					pp[1] = LWS_CLOSE_STATUS_PROTOCOL_ERR & 0xff;
+				}
+			}
+			if (user_callback_handle_rxflow(
+					wsi->protocol->callback, wsi,
+					LWS_CALLBACK_WS_PEER_INITIATED_CLOSE,
+					wsi->user_space, pp,
+					wsi->u.ws.rx_ubuf_head))
+				return -1;
 			/*
 			 * parrot the close packet payload back
 			 * we do not care about how it went, we are closing
 			 * immediately afterwards
 			 */
-			libwebsocket_write(wsi, (unsigned char *)
-			   &wsi->u.ws.rx_user_buffer[
-				LWS_SEND_BUFFER_PRE_PADDING],
-				wsi->u.ws.rx_user_buffer_head, LWS_WRITE_CLOSE);
-			wsi->state = WSI_STATE_RETURNED_CLOSE_ALREADY;
+			lws_write(wsi, (unsigned char *)&wsi->u.ws.rx_ubuf[LWS_PRE],
+				  wsi->u.ws.rx_ubuf_head, LWS_WRITE_CLOSE);
+			wsi->state = LWSS_RETURNED_CLOSE_ALREADY;
 			/* close the connection */
 			return -1;
 
-		case LWS_WS_OPCODE_07__PING:
+		case LWSWSOPC_PING:
 			lwsl_info("received %d byte ping, sending pong\n",
-						 wsi->u.ws.rx_user_buffer_head);
+				  wsi->u.ws.rx_ubuf_head);
+
+			/* he set a close reason on this guy, ignore PING */
+			if (wsi->u.ws.close_in_ping_buffer_len)
+				goto ping_drop;
 
 			if (wsi->u.ws.ping_pending_flag) {
 				/*
@@ -299,52 +410,38 @@ spill:
 			}
 
 			/* control packets can only be < 128 bytes long */
-			if (wsi->u.ws.rx_user_buffer_head > 128 - 4) {
+			if (wsi->u.ws.rx_ubuf_head > 128 - 3) {
 				lwsl_parser("DROP PING payload too large\n");
 				goto ping_drop;
 			}
 
-			/* if existing buffer is too small, drop it */
-			if (wsi->u.ws.ping_payload_buf &&
-			    wsi->u.ws.ping_payload_alloc < wsi->u.ws.rx_user_buffer_head)
-				lws_free2(wsi->u.ws.ping_payload_buf);
-
-			/* if no buffer, allocate it */
-			if (!wsi->u.ws.ping_payload_buf) {
-				wsi->u.ws.ping_payload_buf = lws_malloc(wsi->u.ws.rx_user_buffer_head
-									+ LWS_SEND_BUFFER_PRE_PADDING);
-				wsi->u.ws.ping_payload_alloc =
-					wsi->u.ws.rx_user_buffer_head;
-			}
-
 			/* stash the pong payload */
-			memcpy(wsi->u.ws.ping_payload_buf + LWS_SEND_BUFFER_PRE_PADDING,
-			       &wsi->u.ws.rx_user_buffer[LWS_SEND_BUFFER_PRE_PADDING],
-				wsi->u.ws.rx_user_buffer_head);
+			memcpy(wsi->u.ws.ping_payload_buf + LWS_PRE,
+			       &wsi->u.ws.rx_ubuf[LWS_PRE],
+				wsi->u.ws.rx_ubuf_head);
 
-			wsi->u.ws.ping_payload_len = wsi->u.ws.rx_user_buffer_head;
+			wsi->u.ws.ping_payload_len = wsi->u.ws.rx_ubuf_head;
 			wsi->u.ws.ping_pending_flag = 1;
 
 			/* get it sent as soon as possible */
-			libwebsocket_callback_on_writable(wsi->protocol->owning_server, wsi);
+			lws_callback_on_writable(wsi);
 ping_drop:
-			wsi->u.ws.rx_user_buffer_head = 0;
+			wsi->u.ws.rx_ubuf_head = 0;
 			handled = 1;
 			break;
 
-		case LWS_WS_OPCODE_07__PONG:
+		case LWSWSOPC_PONG:
 			lwsl_info("client receied pong\n");
-			lwsl_hexdump(&wsi->u.ws.rx_user_buffer[
-				LWS_SEND_BUFFER_PRE_PADDING],
-				    wsi->u.ws.rx_user_buffer_head);
+			lwsl_hexdump(&wsi->u.ws.rx_ubuf[LWS_PRE],
+				     wsi->u.ws.rx_ubuf_head);
 
 			/* issue it */
 			callback_action = LWS_CALLBACK_CLIENT_RECEIVE_PONG;
 			break;
 
-		case LWS_WS_OPCODE_07__CONTINUATION:
-		case LWS_WS_OPCODE_07__TEXT_FRAME:
-		case LWS_WS_OPCODE_07__BINARY_FRAME:
+		case LWSWSOPC_CONTINUATION:
+		case LWSWSOPC_TEXT_FRAME:
+		case LWSWSOPC_BINARY_FRAME:
 			break;
 
 		default:
@@ -357,17 +454,15 @@ ping_drop:
 			 * state machine.
 			 */
 
-			eff_buf.token = &wsi->u.ws.rx_user_buffer[
-						   LWS_SEND_BUFFER_PRE_PADDING];
-			eff_buf.token_len = wsi->u.ws.rx_user_buffer_head;
-			
-			if (lws_ext_callback_for_each_active(wsi,
-				LWS_EXT_CALLBACK_EXTENDED_PAYLOAD_RX,
+			eff_buf.token = &wsi->u.ws.rx_ubuf[LWS_PRE];
+			eff_buf.token_len = wsi->u.ws.rx_ubuf_head;
+
+			if (lws_ext_cb_active(wsi,
+				LWS_EXT_CB_EXTENDED_PAYLOAD_RX,
 					&eff_buf, 0) <= 0) { /* not handle or fail */
 
-				lwsl_ext("Unhandled ext opc 0x%x\n",
-							      wsi->u.ws.opcode);
-				wsi->u.ws.rx_user_buffer_head = 0;
+				lwsl_ext("Unhandled ext opc 0x%x\n", wsi->u.ws.opcode);
+				wsi->u.ws.rx_ubuf_head = 0;
 
 				return 0;
 			}
@@ -378,22 +473,46 @@ ping_drop:
 		/*
 		 * No it's real payload, pass it up to the user callback.
 		 * It's nicely buffered with the pre-padding taken care of
-		 * so it can be sent straight out again using libwebsocket_write
+		 * so it can be sent straight out again using lws_write
 		 */
 		if (handled)
 			goto already_done;
 
-		eff_buf.token = &wsi->u.ws.rx_user_buffer[
-						LWS_SEND_BUFFER_PRE_PADDING];
-		eff_buf.token_len = wsi->u.ws.rx_user_buffer_head;
-		
-		if (lws_ext_callback_for_each_active(wsi,
-				LWS_EXT_CALLBACK_PAYLOAD_RX,
-						&eff_buf, 0) < 0) /* fail */
+		eff_buf.token = &wsi->u.ws.rx_ubuf[LWS_PRE];
+		eff_buf.token_len = wsi->u.ws.rx_ubuf_head;
+
+drain_extension:
+		n = lws_ext_cb_active(wsi, LWS_EXT_CB_PAYLOAD_RX, &eff_buf, 0);
+		lwsl_ext("Ext RX returned %d\n", n);
+		if (n < 0) /* fail */
 			return -1;
 
-		if (eff_buf.token_len <= 0 &&
-			    callback_action != LWS_CALLBACK_CLIENT_RECEIVE_PONG)
+		lwsl_ext("post inflate eff_buf len %d\n", eff_buf.token_len);
+
+		if (rx_draining_ext && !eff_buf.token_len) {
+			lwsl_err("   --- ignoring zero drain result, ending drain\n");
+			goto already_done;
+		}
+
+		if (wsi->u.ws.check_utf8 && !wsi->u.ws.defeat_check_utf8) {
+			if (lws_check_utf8(&wsi->u.ws.utf8,
+					   (unsigned char *)eff_buf.token,
+					   eff_buf.token_len))
+				goto utf8_fail;
+
+			/* we are ending partway through utf-8 character? */
+			if (!wsi->u.ws.rx_packet_length && wsi->u.ws.final && wsi->u.ws.utf8 && !n) {
+				lwsl_info("FINAL utf8 error\n");
+utf8_fail:			lwsl_info("utf8 error\n");
+				return -1;
+			}
+		}
+
+		if (eff_buf.token_len < 0 &&
+		    callback_action != LWS_CALLBACK_CLIENT_RECEIVE_PONG)
+			goto already_done;
+
+		if (!eff_buf.token)
 			goto already_done;
 
 		eff_buf.token[eff_buf.token_len] = '\0';
@@ -404,20 +523,31 @@ ping_drop:
 		if (callback_action == LWS_CALLBACK_CLIENT_RECEIVE_PONG)
 			lwsl_info("Client doing pong callback\n");
 
-		m = wsi->protocol->callback(
-			wsi->protocol->owning_server,
-			wsi,
-			(enum libwebsocket_callback_reasons)callback_action,
-			wsi->user_space,
-			eff_buf.token,
-			eff_buf.token_len);
+		if (n && eff_buf.token_len) {
+			/* extension had more... main loop will come back
+			 * we want callback to be done with this set, if so,
+			 * because lws_is_final() hides it was final until the
+			 * last chunk
+			 */
+			wsi->u.ws.rx_draining_ext = 1;
+			wsi->u.ws.rx_draining_ext_list = pt->rx_draining_ext_list;
+			pt->rx_draining_ext_list = wsi;
+			lwsl_ext("%s: RX EXT DRAINING: Adding to list\n", __func__);
+		}
+		if (wsi->state == LWSS_RETURNED_CLOSE_ALREADY ||
+		    wsi->state == LWSS_AWAITING_CLOSE_ACK)
+			goto already_done;
+
+		m = wsi->protocol->callback(wsi,
+			(enum lws_callback_reasons)callback_action,
+			wsi->user_space, eff_buf.token, eff_buf.token_len);
 
 		/* if user code wants to close, let caller know */
 		if (m)
 			return 1;
 
 already_done:
-		wsi->u.ws.rx_user_buffer_head = 0;
+		wsi->u.ws.rx_ubuf_head = 0;
 		break;
 	default:
 		lwsl_err("client rx illegal state\n");
@@ -427,7 +557,6 @@ already_done:
 	return 0;
 
 illegal_ctl_length:
-
 	lwsl_warn("Control frame asking for extended length is illegal\n");
 	/* kill the connection */
 	return -1;

@@ -1,7 +1,7 @@
 /*
  * libwebsockets - small server side websockets and web server implementation
  *
- * Copyright (C) 2010-2014 Andy Green <andy@warmcat.com>
+ * Copyright (C) 2010-2015 Andy Green <andy@warmcat.com>
  *
  *  This library is free software; you can redistribute it and/or
  *  modify it under the terms of the GNU Lesser General Public
@@ -34,23 +34,297 @@ static const char *library_version = LWS_LIBRARY_VERSION " " LWS_BUILD_HASH;
  *	representing the library version followed by the git head hash it
  *	was built from
  */
-
 LWS_VISIBLE const char *
 lws_get_library_version(void)
 {
 	return library_version;
 }
 
+static const char * const mount_protocols[] = {
+	"http://",
+	"https://",
+	"file://",
+	"cgi://"
+};
+
+LWS_VISIBLE LWS_EXTERN int
+lws_write_http_mount(struct lws_http_mount *next, struct lws_http_mount **res,
+		     void *store, const char *mountpoint, const char *origin,
+		     const char *def)
+{
+	struct lws_http_mount *m;
+	void *orig = store;
+	unsigned long l = (unsigned long)store;
+	int n;
+
+	if (l & 15)
+		l += 16 - (l & 15);
+
+	store = (void *)l;
+	m = (struct lws_http_mount *)store;
+	*res = m;
+
+	m->def = def;
+	m->mountpoint = mountpoint;
+	m->mountpoint_len = (unsigned char)strlen(mountpoint);
+	m->mount_next = NULL;
+	if (next)
+		next->mount_next = m;
+	for (n = 0; n < ARRAY_SIZE(mount_protocols); n++)
+		if (!strncmp(origin, mount_protocols[n],
+		     strlen(mount_protocols[n]))) {
+			m->origin_protocol = n;
+			m->origin = origin + strlen(mount_protocols[n]);
+			break;
+		}
+
+	if (n == ARRAY_SIZE(mount_protocols)) {
+		lwsl_err("unsupported protocol://\n");
+		return 0; /* ie, fail */
+	}
+
+	return ((char *)store + sizeof(*m)) - (char *)orig;
+}
+
+LWS_VISIBLE void *
+lws_protocol_vh_priv_zalloc(struct lws_vhost *vhost, const struct lws_protocols *prot,
+			    int size)
+{
+	int n = 0;
+
+	/* allocate the vh priv array only on demand */
+	if (!vhost->protocol_vh_privs) {
+		vhost->protocol_vh_privs = (void **)lws_zalloc(
+				vhost->count_protocols * sizeof(void *));
+		if (!vhost->protocol_vh_privs)
+			return NULL;
+	}
+
+	while (n < vhost->count_protocols && &vhost->protocols[n] != prot)
+		n++;
+
+	if (n == vhost->count_protocols)
+		return NULL;
+
+	vhost->protocol_vh_privs[n] = lws_zalloc(size);
+	return vhost->protocol_vh_privs[n];
+}
+
+LWS_VISIBLE void *
+lws_protocol_vh_priv_get(struct lws_vhost *vhost, const struct lws_protocols *prot)
+{
+	int n = 0;
+
+	if (!vhost->protocol_vh_privs)
+		return NULL;
+
+	while (n < vhost->count_protocols && &vhost->protocols[n] != prot)
+		n++;
+
+	if (n == vhost->count_protocols) {
+		lwsl_err("%s: unknown protocol %p\n", __func__, prot);
+		return NULL;
+	}
+
+	return vhost->protocol_vh_privs[n];
+}
+
+int
+lws_protocol_init(struct lws_context *context)
+{
+	struct lws_vhost *vh = context->vhost_list;
+	struct lws wsi;
+	int n;
+
+	memset(&wsi, 0, sizeof(wsi));
+	wsi.context = context;
+
+	while (vh) {
+		wsi.vhost = vh;
+
+		/* initialize supported protocols on this vhost */
+
+		for (n = 0; n < vh->count_protocols; n++) {
+			wsi.protocol = &vh->protocols[n];
+
+			/*
+			 * inform all the protocols that they are doing their one-time
+			 * initialization if they want to.
+			 *
+			 * NOTE the wsi is all zeros except for the context, vh and
+			 * protocol ptrs so lws_get_context(wsi) etc can work
+			 */
+			vh->protocols[n].callback(&wsi,
+				LWS_CALLBACK_PROTOCOL_INIT, NULL, NULL, 0);
+		}
+
+		vh = vh->vhost_next;
+	}
+
+	context->protocol_init_done = 1;
+
+	return 0;
+}
+
+LWS_VISIBLE struct lws_vhost *
+lws_create_vhost(struct lws_context *context,
+		 struct lws_context_creation_info *info,
+		 struct lws_http_mount *mounts)
+{
+	struct lws_vhost *vh = lws_zalloc(sizeof(*vh)),
+			 **vh1 = &context->vhost_list;
+#ifdef LWS_WITH_PLUGINS
+	struct lws_plugin *plugin = context->plugin_list;
+	struct lws_protocols *lwsp;
+	int m;
+#endif
+	char *p;
+
+	if (!vh)
+		return NULL;
+
+	vh->context = context;
+	if (!info->vhost_name)
+		vh->name = "default";
+	else
+		vh->name = info->vhost_name;
+
+	vh->iface = info->iface;
+	for (vh->count_protocols = 0;
+	     info->protocols[vh->count_protocols].callback;
+	     vh->count_protocols++)
+		;
+#ifdef LWS_WITH_PLUGINS
+	if (plugin) {
+		/*
+		 * give the vhost a unified list of protocols including the
+		 * ones that came from plugins
+		 */
+		lwsp = lws_zalloc(sizeof(struct lws_protocols) *
+					   (vh->count_protocols +
+					   context->plugin_protocol_count + 1));
+		if (!lwsp)
+			return NULL;
+
+		m = vh->count_protocols;
+		memcpy(lwsp, info->protocols,
+		       sizeof(struct lws_protocols) * m);
+		while (plugin) {
+			memcpy(&lwsp[m], plugin->caps.protocols,
+			       sizeof(struct lws_protocols) *
+			       plugin->caps.count_protocols);
+			m += plugin->caps.count_protocols;
+			vh->count_protocols += plugin->caps.count_protocols;
+			plugin = plugin->list;
+		}
+		vh->protocols = lwsp;
+	} else
+#endif
+		vh->protocols = info->protocols;
+
+
+	vh->mount_list = mounts;
+
+	lwsl_notice("Creating Vhost '%s' port %d, %d protocols\n",
+			vh->name, info->port, vh->count_protocols);
+
+	while (mounts) {
+		lwsl_notice("   mounting %s%s to %s\n",
+				mount_protocols[mounts->origin_protocol],
+				mounts->origin, mounts->mountpoint);
+		mounts = mounts->mount_next;
+	}
+
+#ifndef LWS_NO_EXTENSIONS
+#ifdef LWS_WITH_PLUGINS
+	if (context->plugin_extension_count) {
+
+		m = 0;
+		while (info->extensions && info->extensions[m].callback)
+			m++;
+
+		/*
+		 * give the vhost a unified list of extensions including the
+		 * ones that came from plugins
+		 */
+		vh->extensions = lws_zalloc(sizeof(struct lws_extension) *
+					   (m +
+					   context->plugin_extension_count + 1));
+		if (!vh->extensions)
+			return NULL;
+
+		memcpy((struct lws_extension *)vh->extensions, info->extensions,
+		       sizeof(struct lws_extension) * m);
+		while (plugin) {
+			memcpy((struct lws_extension *)&vh->extensions[m], plugin->caps.extensions,
+			       sizeof(struct lws_extension) *
+			       plugin->caps.count_extensions);
+			m += plugin->caps.count_extensions;
+			plugin = plugin->list;
+		}
+	} else
+#endif
+		vh->extensions = info->extensions;
+#endif
+
+	vh->listen_port = info->port;
+	vh->http_proxy_port = 0;
+	vh->http_proxy_address[0] = '\0';
+
+	/* either use proxy from info, or try get it from env var */
+
+	if (info->http_proxy_address) {
+		/* override for backwards compatibility */
+		if (info->http_proxy_port)
+			vh->http_proxy_port = info->http_proxy_port;
+		lws_set_proxy(vh, info->http_proxy_address);
+	} else {
+#ifdef LWS_HAVE_GETENV
+		p = getenv("http_proxy");
+		if (p)
+			lws_set_proxy(vh, p);
+#endif
+	}
+
+	vh->ka_time = info->ka_time;
+	vh->ka_interval = info->ka_interval;
+	vh->ka_probes = info->ka_probes;
+
+	if (lws_context_init_server_ssl(info, vh))
+		goto bail;
+
+	if (lws_context_init_client_ssl(info, vh))
+		goto bail;
+
+	if (lws_context_init_server(info, vh))
+		goto bail;
+
+	while (1) {
+		if (!(*vh1)) {
+			*vh1 = vh;
+			break;
+		}
+		vh1 = &(*vh1)->vhost_next;
+	};
+
+	return vh;
+
+bail:
+	lws_free(vh);
+
+	return NULL;
+}
+
 /**
- * libwebsocket_create_context() - Create the websocket handler
+ * lws_create_context() - Create the websocket handler
  * @info:	pointer to struct with parameters
  *
  *	This function creates the listening socket (if serving) and takes care
  *	of all initialization in one step.
  *
- *	After initialization, it returns a struct libwebsocket_context * that
+ *	After initialization, it returns a struct lws_context * that
  *	represents this server.  After calling, user code needs to take care
- *	of calling libwebsocket_service() with the context pointer to get the
+ *	of calling lws_service() with the context pointer to get the
  *	server's sockets serviced.  This must be done in the same process
  *	context as the initialization call.
  *
@@ -70,21 +344,21 @@ lws_get_library_version(void)
  *	images or whatever over http and dynamic data over websockets all in
  *	one place; they're all handled in the user callback.
  */
-
-LWS_VISIBLE struct libwebsocket_context *
-libwebsocket_create_context(struct lws_context_creation_info *info)
+LWS_VISIBLE struct lws_context *
+lws_create_context(struct lws_context_creation_info *info)
 {
-	struct libwebsocket_context *context = NULL;
-	char *p;
-#ifdef _WIN32
-	int i;
-#endif
+	struct lws_context *context = NULL;
+	struct lws wsi;
+#ifndef LWS_NO_DAEMONIZE
 	int pid_daemon = get_daemonize_pid();
+#endif
+	int n, m;
 
 	lwsl_notice("Initial logging level %d\n", log_level);
-	lwsl_notice("Library version: %s\n", library_version);
+	lwsl_notice("Libwebsockets version: %s\n", library_version);
+#if LWS_POSIX
 #ifdef LWS_USE_IPV6
-	if (!(info->options & LWS_SERVER_OPTION_DISABLE_IPV6))
+	if (!lws_check_opt(info->options, LWS_SERVER_OPTION_DISABLE_IPV6))
 		lwsl_notice("IPV6 compiled in and enabled\n");
 	else
 		lwsl_notice("IPV6 compiled in but disabled\n");
@@ -92,199 +366,217 @@ libwebsocket_create_context(struct lws_context_creation_info *info)
 	lwsl_notice("IPV6 not compiled in\n");
 #endif
 	lws_feature_status_libev(info);
-	lwsl_info(" LWS_MAX_HEADER_LEN: %u\n", LWS_MAX_HEADER_LEN);
-	lwsl_info(" LWS_MAX_PROTOCOLS: %u\n", LWS_MAX_PROTOCOLS);
-
-	lwsl_info(" SPEC_LATEST_SUPPORTED: %u\n", SPEC_LATEST_SUPPORTED);
-	lwsl_info(" AWAITING_TIMEOUT: %u\n", AWAITING_TIMEOUT);
+	lws_feature_status_libuv(info);
+#endif
+	lwsl_info(" LWS_DEF_HEADER_LEN    : %u\n", LWS_DEF_HEADER_LEN);
+	lwsl_info(" LWS_MAX_PROTOCOLS     : %u\n", LWS_MAX_PROTOCOLS);
+	lwsl_info(" LWS_MAX_SMP           : %u\n", LWS_MAX_SMP);
+	lwsl_info(" SPEC_LATEST_SUPPORTED : %u\n", SPEC_LATEST_SUPPORTED);
+	lwsl_info(" sizeof (*info)        : %u\n", sizeof(*info));
+#if LWS_POSIX
 	lwsl_info(" SYSTEM_RANDOM_FILEPATH: '%s'\n", SYSTEM_RANDOM_FILEPATH);
-	lwsl_info(" LWS_MAX_ZLIB_CONN_BUFFER: %u\n", LWS_MAX_ZLIB_CONN_BUFFER);
-
+#endif
 	if (lws_plat_context_early_init())
 		return NULL;
 
-	context = lws_zalloc(sizeof(struct libwebsocket_context));
+	context = lws_zalloc(sizeof(struct lws_context));
 	if (!context) {
 		lwsl_err("No memory for websocket context\n");
 		return NULL;
 	}
-
+#ifndef LWS_NO_DAEMONIZE
 	if (pid_daemon) {
 		context->started_with_parent = pid_daemon;
 		lwsl_notice(" Started with daemon pid %d\n", pid_daemon);
 	}
-
-	context->listen_service_extraseen = 0;
-	context->protocols = info->protocols;
-	context->token_limits = info->token_limits;
-	context->listen_port = info->port;
-	context->http_proxy_port = 0;
-	context->http_proxy_address[0] = '\0';
-	context->options = info->options;
-	context->iface = info->iface;
-	context->ka_time = info->ka_time;
-	context->ka_interval = info->ka_interval;
-	context->ka_probes = info->ka_probes;
-
-	/* to reduce this allocation, */
+#endif
 	context->max_fds = getdtablesize();
-	lwsl_notice(" static allocation: %u + (%u x %u fds) = %u bytes\n",
-		sizeof(struct libwebsocket_context),
-		sizeof(struct libwebsocket_pollfd) +
-					sizeof(struct libwebsocket *),
-		context->max_fds,
-		sizeof(struct libwebsocket_context) +
-		((sizeof(struct libwebsocket_pollfd) +
-					sizeof(struct libwebsocket *)) *
-							     context->max_fds));
 
-	context->fds = lws_zalloc(sizeof(struct libwebsocket_pollfd) *
-				  context->max_fds);
-	if (context->fds == NULL) {
-		lwsl_err("Unable to allocate fds array for %d connections\n",
-							      context->max_fds);
-		lws_free(context);
-		return NULL;
-	}
+	if (info->count_threads)
+		context->count_threads = info->count_threads;
+	else
+		context->count_threads = 1;
 
-#ifdef _WIN32
-	for (i = 0; i < FD_HASHTABLE_MODULUS; i++) {
-		context->fd_hashtable[i].wsi = lws_zalloc(sizeof(struct libwebsocket*) * context->max_fds);
-	}
-#else
-	context->lws_lookup = lws_zalloc(sizeof(struct libwebsocket *) * context->max_fds);
-	if (context->lws_lookup == NULL) {
-		lwsl_err(
-		  "Unable to allocate lws_lookup array for %d connections\n",
-							      context->max_fds);
-		lws_free(context->fds);
-		lws_free(context);
-		return NULL;
-	}
-#endif
+	if (context->count_threads > LWS_MAX_SMP)
+		context->count_threads = LWS_MAX_SMP;
 
-	if (lws_plat_init_fd_tables(context)) {
-#ifdef _WIN32
-		for (i = 0; i < FD_HASHTABLE_MODULUS; i++) {
-			lws_free(context->fd_hashtable[i].wsi);
+	context->token_limits = info->token_limits;
+
+	context->options = info->options;
+
+	if (info->timeout_secs)
+		context->timeout_secs = info->timeout_secs;
+	else
+		context->timeout_secs = AWAITING_TIMEOUT;
+
+	lwsl_info(" default timeout (secs): %u\n", context->timeout_secs);
+
+	if (info->max_http_header_data)
+		context->max_http_header_data = info->max_http_header_data;
+	else
+		context->max_http_header_data = LWS_DEF_HEADER_LEN;
+	if (info->max_http_header_pool)
+		context->max_http_header_pool = info->max_http_header_pool;
+	else
+		context->max_http_header_pool = LWS_DEF_HEADER_POOL;
+
+	/*
+	 * Allocate the per-thread storage for scratchpad buffers,
+	 * and header data pool
+	 */
+	for (n = 0; n < context->count_threads; n++) {
+		context->pt[n].serv_buf = lws_zalloc(LWS_MAX_SOCKET_IO_BUF);
+		if (!context->pt[n].serv_buf) {
+			lwsl_err("OOM\n");
+			return NULL;
 		}
-#else
-		lws_free(context->lws_lookup);
-#endif
-		lws_free(context->fds);
-		lws_free(context);
+
+		context->pt[n].context = context;
+		context->pt[n].tid = n;
+		context->pt[n].http_header_data = lws_malloc(context->max_http_header_data *
+						       context->max_http_header_pool);
+		if (!context->pt[n].http_header_data)
+			goto bail;
+
+		context->pt[n].ah_pool = lws_zalloc(sizeof(struct allocated_headers) *
+					      context->max_http_header_pool);
+		for (m = 0; m < context->max_http_header_pool; m++)
+			context->pt[n].ah_pool[m].data =
+				(char *)context->pt[n].http_header_data +
+				(m * context->max_http_header_data);
+		if (!context->pt[n].ah_pool)
+			goto bail;
+
+		lws_pt_mutex_init(&context->pt[n]);
+	}
+
+	if (info->fd_limit_per_thread)
+		context->fd_limit_per_thread = info->fd_limit_per_thread;
+	else
+		context->fd_limit_per_thread = context->max_fds /
+					       context->count_threads;
+
+	lwsl_notice(" Threads: %d each %d fds\n", context->count_threads,
+		    context->fd_limit_per_thread);
+
+	memset(&wsi, 0, sizeof(wsi));
+	wsi.context = context;
+
+	if (!info->ka_interval && info->ka_time > 0) {
+		lwsl_err("info->ka_interval can't be 0 if ka_time used\n");
 		return NULL;
 	}
+
+#ifdef LWS_USE_LIBEV
+	/* (Issue #264) In order to *avoid breaking backwards compatibility*, we
+	 * enable libev mediated SIGINT handling with a default handler of
+	 * lws_sigint_cb. The handler can be overridden or disabled
+	 * by invoking lws_sigint_cfg after creating the context, but
+	 * before invoking lws_initloop:
+	 */
+	context->use_ev_sigint = 1;
+	context->lws_ev_sigint_cb = &lws_ev_sigint_cb;
+#endif /* LWS_USE_LIBEV */
+#ifdef LWS_USE_LIBUV
+	/* (Issue #264) In order to *avoid breaking backwards compatibility*, we
+	 * enable libev mediated SIGINT handling with a default handler of
+	 * lws_sigint_cb. The handler can be overridden or disabled
+	 * by invoking lws_sigint_cfg after creating the context, but
+	 * before invoking lws_initloop:
+	 */
+	context->use_ev_sigint = 1;
+	context->lws_uv_sigint_cb = &lws_uv_sigint_cb;
+#endif
+
+	lwsl_info(" mem: context:         %5u bytes (%d ctx + (%d thr x %d))\n",
+		  sizeof(struct lws_context) +
+		  (context->count_threads * LWS_MAX_SOCKET_IO_BUF),
+		  sizeof(struct lws_context),
+		  context->count_threads,
+		  LWS_MAX_SOCKET_IO_BUF);
+
+	lwsl_info(" mem: http hdr rsvd:   %5u bytes (%u thr x (%u + %u) x %u))\n",
+		    (context->max_http_header_data +
+		     sizeof(struct allocated_headers)) *
+		    context->max_http_header_pool * context->count_threads,
+		    context->count_threads,
+		    context->max_http_header_data,
+		    sizeof(struct allocated_headers),
+		    context->max_http_header_pool);
+	n = sizeof(struct lws_pollfd) * context->count_threads *
+	    context->fd_limit_per_thread;
+	context->pt[0].fds = lws_zalloc(n);
+	if (context->pt[0].fds == NULL) {
+		lwsl_err("OOM allocating %d fds\n", context->max_fds);
+		goto bail;
+	}
+	lwsl_info(" mem: pollfd map:      %5u\n", n);
+
+#if LWS_MAX_SMP > 1
+	/* each thread serves his own chunk of fds */
+	for (n = 1; n < (int)info->count_threads; n++)
+		context->pt[n].fds = context->pt[n - 1].fds +
+				     context->fd_limit_per_thread;
+#endif
+
+	if (lws_plat_init(context, info))
+		goto bail;
+
+	lws_context_init_ssl_library(info);
+
+	/*
+	 * if he's not saying he'll make his own vhosts later then act
+	 * compatibly and make a default vhost using the data in the info
+	 */
+	if (!lws_check_opt(info->options, LWS_SERVER_OPTION_EXPLICIT_VHOSTS))
+		if (!lws_create_vhost(context, info, NULL)) {
+			lwsl_err("Failed to create default vhost\n");
+			return NULL;
+		}
 
 	lws_context_init_extensions(info, context);
 
 	context->user_space = info->user;
 
-	strcpy(context->canonical_hostname, "unknown");
+	lwsl_notice(" mem: per-conn:        %5u bytes + protocol rx buf\n",
+		    sizeof(struct lws));
 
+	strcpy(context->canonical_hostname, "unknown");
 	lws_server_get_canonical_hostname(context, info);
 
-	/* split the proxy ads:port if given */
-
-	if (info->http_proxy_address) {
-		strncpy(context->http_proxy_address, info->http_proxy_address,
-				      sizeof(context->http_proxy_address) - 1);
-		context->http_proxy_address[
-				sizeof(context->http_proxy_address) - 1] = '\0';
-		context->http_proxy_port = info->http_proxy_port;
-	} else {
-#ifdef HAVE_GETENV
-		p = getenv("http_proxy");
-		if (p) {
-			strncpy(context->http_proxy_address, p,
-				       sizeof(context->http_proxy_address) - 1);
-			context->http_proxy_address[
-				sizeof(context->http_proxy_address) - 1] = '\0';
-
-			p = strchr(context->http_proxy_address, ':');
-			if (p == NULL) {
-				lwsl_err("http_proxy needs to be ads:port\n");
-				goto bail;
-			}
-			*p = '\0';
-			context->http_proxy_port = atoi(p + 1);
-		}
-#endif
-	}
-
-	if (context->http_proxy_address[0])
-		lwsl_notice(" Proxy %s:%u\n",
-				context->http_proxy_address,
-						      context->http_proxy_port);
-
-	lwsl_notice(
-		" per-conn mem: %u + %u headers + protocol rx buf\n",
-				sizeof(struct libwebsocket),
-					      sizeof(struct allocated_headers));
-
-	if (lws_context_init_server_ssl(info, context))
-		goto bail;
-
-	if (lws_context_init_client_ssl(info, context))
-		goto bail;
-
-	if (lws_context_init_server(info, context))
-		goto bail;
+	context->uid = info->uid;
+	context->gid = info->gid;
 
 	/*
 	 * drop any root privs for this process
 	 * to listen on port < 1023 we would have needed root, but now we are
 	 * listening, we don't want the power for anything else
 	 */
-	lws_plat_drop_app_privileges(info);
-
-	/* initialize supported protocols */
-
-	for (context->count_protocols = 0;
-		info->protocols[context->count_protocols].callback;
-						   context->count_protocols++) {
-
-		lwsl_parser("  Protocol: %s\n",
-				info->protocols[context->count_protocols].name);
-
-		info->protocols[context->count_protocols].owning_server =
-									context;
-		info->protocols[context->count_protocols].protocol_index =
-						       context->count_protocols;
-
-		/*
-		 * inform all the protocols that they are doing their one-time
-		 * initialization if they want to
-		 */
-		info->protocols[context->count_protocols].callback(context,
-			       NULL, LWS_CALLBACK_PROTOCOL_INIT, NULL, NULL, 0);
-	}
+	if (!lws_check_opt(info->options, LWS_SERVER_OPTION_EXPLICIT_VHOSTS))
+		lws_plat_drop_app_privileges(info);
 
 	/*
 	 * give all extensions a chance to create any per-context
 	 * allocations they need
 	 */
-
 	if (info->port != CONTEXT_PORT_NO_LISTEN) {
-		if (lws_ext_callback_for_each_extension_type(context, NULL,
-				LWS_EXT_CALLBACK_SERVER_CONTEXT_CONSTRUCT,
-								   NULL, 0) < 0)
+		if (lws_ext_cb_all_exts(context, NULL,
+			LWS_EXT_CB_SERVER_CONTEXT_CONSTRUCT, NULL, 0) < 0)
 			goto bail;
 	} else
-		if (lws_ext_callback_for_each_extension_type(context, NULL,
-				LWS_EXT_CALLBACK_CLIENT_CONTEXT_CONSTRUCT,
-								   NULL, 0) < 0)
+		if (lws_ext_cb_all_exts(context, NULL,
+			LWS_EXT_CB_CLIENT_CONTEXT_CONSTRUCT, NULL, 0) < 0)
 			goto bail;
 
 	return context;
 
 bail:
-	libwebsocket_context_destroy(context);
+	lws_context_destroy(context);
 	return NULL;
 }
 
 /**
- * libwebsocket_context_destroy() - Destroy the websocket context
+ * lws_context_destroy() - Destroy the websocket context
  * @context:	Websocket context
  *
  *	This function closes any active connections and then frees the
@@ -292,64 +584,130 @@ bail:
  *	undefined.
  */
 LWS_VISIBLE void
-libwebsocket_context_destroy(struct libwebsocket_context *context)
+lws_context_destroy(struct lws_context *context)
 {
-	int n;
-	struct libwebsocket_protocols *protocol = context->protocols;
+	const struct lws_protocols *protocol = NULL;
+	struct lws_context_per_thread *pt;
+	struct lws_vhost *vh, *vh1;
+	struct lws wsi;
+	int n, m;
 
 	lwsl_notice("%s\n", __func__);
+
+	if (!context)
+		return;
+
+	m = context->count_threads;
+	context->being_destroyed = 1;
+
+	memset(&wsi, 0, sizeof(wsi));
+	wsi.context = context;
 
 #ifdef LWS_LATENCY
 	if (context->worst_latency_info[0])
 		lwsl_notice("Worst latency: %s\n", context->worst_latency_info);
 #endif
 
-	for (n = 0; n < context->fds_count; n++) {
-		struct libwebsocket *wsi =
-					wsi_from_fd(context, context->fds[n].fd);
-		if (!wsi)
-			continue;
-		libwebsocket_close_and_free_session(context,
-			wsi, LWS_CLOSE_STATUS_NOSTATUS_CONTEXT_DESTROY /* no protocol close */);
-		n--;
-	}
+	while (m--) {
+		pt = &context->pt[m];
 
+		for (n = 0; (unsigned int)n < context->pt[m].fds_count; n++) {
+			struct lws *wsi = wsi_from_fd(context, pt->fds[n].fd);
+			if (!wsi)
+				continue;
+
+			lws_close_free_wsi(wsi,
+				LWS_CLOSE_STATUS_NOSTATUS_CONTEXT_DESTROY
+				/* no protocol close */);
+			n--;
+		}
+	}
 	/*
 	 * give all extensions a chance to clean up any per-context
 	 * allocations they might have made
 	 */
-	if (context->listen_port != CONTEXT_PORT_NO_LISTEN) {
-		if (lws_ext_callback_for_each_extension_type(context, NULL,
-			 LWS_EXT_CALLBACK_SERVER_CONTEXT_DESTRUCT, NULL, 0) < 0)
-			return;
-	} else
-		if (lws_ext_callback_for_each_extension_type(context, NULL,
-			 LWS_EXT_CALLBACK_CLIENT_CONTEXT_DESTRUCT, NULL, 0) < 0)
-			return;
+
+	n = lws_ext_cb_all_exts(context, NULL,
+				LWS_EXT_CB_SERVER_CONTEXT_DESTRUCT, NULL, 0);
+
+	n = lws_ext_cb_all_exts(context, NULL,
+				LWS_EXT_CB_CLIENT_CONTEXT_DESTRUCT, NULL, 0);
 
 	/*
 	 * inform all the protocols that they are done and will have no more
-	 * callbacks
+	 * callbacks.
+	 *
+	 * We can't free things until after the event loop shuts down.
 	 */
+	vh = context->vhost_list;
+	while (vh) {
+		wsi.vhost = vh;
+		protocol = vh->protocols;
+		if (protocol) {
+			n = 0;
+			while (n < vh->count_protocols) {
+				wsi.protocol = protocol;
+				protocol->callback(&wsi, LWS_CALLBACK_PROTOCOL_DESTROY,
+						   NULL, NULL, 0);
+				protocol++;
+				n++;
+			}
+		}
 
-	while (protocol->callback) {
-		protocol->callback(context, NULL, LWS_CALLBACK_PROTOCOL_DESTROY,
-				NULL, NULL, 0);
-		protocol++;
+		vh = vh->vhost_next;
 	}
 
-	lws_plat_context_early_destroy(context);
+	for (n = 0; n < context->count_threads; n++) {
+		pt = &context->pt[n];
 
+		lws_libev_destroyloop(context, n);
+		lws_libuv_destroyloop(context, n);
+
+		lws_free_set_NULL(context->pt[n].serv_buf);
+		if (pt->ah_pool)
+			lws_free(pt->ah_pool);
+		if (pt->http_header_data)
+			lws_free(pt->http_header_data);
+	}
+	lws_plat_context_early_destroy(context);
 	lws_ssl_context_destroy(context);
 
-	lws_free(context->fds);
-#ifdef _WIN32
-	for (n = 0; n < FD_HASHTABLE_MODULUS; n++) {
-		lws_free(context->fd_hashtable[n].wsi);
-	}
-#else
-	lws_free(context->lws_lookup);
+	if (context->pt[0].fds)
+		lws_free_set_NULL(context->pt[0].fds);
+
+	/* free all the vhost allocations */
+
+	vh = context->vhost_list;
+	while (vh) {
+		protocol = vh->protocols;
+		if (protocol) {
+			n = 0;
+			while (n < vh->count_protocols) {
+				if (vh->protocol_vh_privs &&
+				    vh->protocol_vh_privs[n]) {
+					lws_free(vh->protocol_vh_privs[n]);
+					vh->protocol_vh_privs[n] = NULL;
+				}
+				protocol++;
+				n++;
+			}
+		}
+		if (vh->protocol_vh_privs)
+			lws_free(vh->protocol_vh_privs);
+		lws_ssl_SSL_CTX_destroy(vh);
+#ifdef LWS_WITH_PLUGINS
+		if (context->plugin_list)
+			lws_free((void *)vh->protocols);
+#ifndef LWS_NO_EXTENSIONS
+		if (context->plugin_extension_count)
+			lws_free((void *)vh->extensions);
 #endif
+#endif
+		vh1 = vh->vhost_next;
+		lws_free(vh);
+		vh = vh1;
+	}
+
 	lws_plat_context_late_destroy(context);
 
 	lws_free(context);

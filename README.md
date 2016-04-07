@@ -1,5 +1,5 @@
 [![Travis Build Status](https://travis-ci.org/warmcat/libwebsockets.png)](https://travis-ci.org/warmcat/libwebsockets)
-[![Appveyor Build status](https://ci.appveyor.com/api/projects/status/baadj9gkpxhi5rhy)](https://ci.appveyor.com/project/warmcat/libwebsockets)
+[![Appveyor Build status](https://ci.appveyor.com/api/projects/status/qfasji8mnfnd2r8t)](https://ci.appveyor.com/project/warmcat/libwebsockets)
 [![Coverity Scan Build Status](https://scan.coverity.com/projects/3576/badge.svg)](https://scan.coverity.com/projects/3576)
 
 libwebsockets
@@ -8,16 +8,21 @@ libwebsockets
 This is the libwebsockets C library for lightweight websocket clients and
 servers.  For support, visit
 
- http://libwebsockets.org
+ https://libwebsockets.org
+ https://github.com/warmcat/libwebsockets
 
 and consider joining the project mailing list at
 
- http://ml.libwebsockets.org/mailman/listinfo/libwebsockets
+ https://libwebsockets.org/mailman/listinfo/libwebsockets
 
-You can get the latest version of the library from git
+| News |
+------
+| We have updated https://libwebsockets.org, if you would like your project using lws featured in the image carousel, send an image, project URL and brief summary to andy@warmcat.com |
 
-- http://git.libwebsockets.org
+You can get the latest version of the library from git:
+
 - https://github.com/warmcat/libwebsockets
+- https://libwebsockets.org/git
 
 for more information:
 

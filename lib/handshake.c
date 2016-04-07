@@ -1,7 +1,7 @@
 /*
  * libwebsockets - small server side websockets and web server implementation
  *
- * Copyright (C) 2010-2013 Andy Green <andy@warmcat.com>
+ * Copyright (C) 2010-2015 Andy Green <andy@warmcat.com>
  *
  *  This library is free software; you can redistribute it and/or
  *  modify it under the terms of the GNU Lesser General Public
@@ -49,26 +49,30 @@
 #ifndef min
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #endif
+
 /*
  * We have to take care about parsing because the headers may be split
  * into multiple fragments.  They may contain unknown headers with arbitrary
  * argument lengths.  So, we parse using a single-character at a time state
  * machine that is completely independent of packet size.
+ *
+ * Returns <0 for error or length of chars consumed from buf (up to len)
  */
 
 LWS_VISIBLE int
-libwebsocket_read(struct libwebsocket_context *context,
-		     struct libwebsocket *wsi, unsigned char *buf, size_t len)
+lws_read(struct lws *wsi, unsigned char *buf, size_t len)
 {
-	size_t n;
+	unsigned char *last_char, *oldbuf = buf;
 	int body_chunk_len;
-	unsigned char *last_char;
+	size_t n;
+
+	lwsl_debug("%s: incoming len %d\n", __func__, (int)len);
 
 	switch (wsi->state) {
 #ifdef LWS_USE_HTTP2
-	case WSI_STATE_HTTP2_AWAIT_CLIENT_PREFACE:
-	case WSI_STATE_HTTP2_ESTABLISHED_PRE_SETTINGS:
-	case WSI_STATE_HTTP2_ESTABLISHED:
+	case LWSS_HTTP2_AWAIT_CLIENT_PREFACE:
+	case LWSS_HTTP2_ESTABLISHED_PRE_SETTINGS:
+	case LWSS_HTTP2_ESTABLISHED:
 		n = 0;
 		while (n < len) {
 			/*
@@ -83,55 +87,66 @@ libwebsocket_read(struct libwebsocket_context *context,
 			/* account for what we're using in rxflow buffer */
 			if (wsi->rxflow_buffer)
 				wsi->rxflow_pos++;
-			if (lws_http2_parser(context, wsi, buf[n++]))
+			if (lws_http2_parser(wsi, buf[n++]))
 				goto bail;
 		}
 		break;
 #endif
-http_new:
-	case WSI_STATE_HTTP:
+
+	case LWSS_HTTP:
 		wsi->hdr_parsing_completed = 0;
 		/* fallthru */
-	case WSI_STATE_HTTP_ISSUING_FILE:
-		wsi->state = WSI_STATE_HTTP_HEADERS;
+	case LWSS_HTTP_ISSUING_FILE:
+		wsi->state = LWSS_HTTP_HEADERS;
 		wsi->u.hdr.parser_state = WSI_TOKEN_NAME_PART;
 		wsi->u.hdr.lextable_pos = 0;
 		/* fallthru */
-	case WSI_STATE_HTTP_HEADERS:
+	case LWSS_HTTP_HEADERS:
+		assert(wsi->u.hdr.ah);
 		lwsl_parser("issuing %d bytes to parser\n", (int)len);
 
 		if (lws_handshake_client(wsi, &buf, len))
 			goto bail;
 
 		last_char = buf;
-		if (lws_handshake_server(context, wsi, &buf, len))
+		if (lws_handshake_server(wsi, &buf, len))
 			/* Handshake indicates this session is done. */
 			goto bail;
 
-		/* It's possible that we've exhausted our data already, but
-		 * lws_handshake_server doesn't update len for us. Figure out how
-		 * much was read, so that we can proceed appropriately: */
+		/*
+		 * It's possible that we've exhausted our data already, or
+		 * rx flow control has stopped us dealing with this early,
+		 * but lws_handshake_server doesn't update len for us.
+		 * Figure out how much was read, so that we can proceed
+		 * appropriately:
+		 */
 		len -= (buf - last_char);
+		lwsl_debug("%s: thinks we have used %d\n", __func__, len);
 
 		if (!wsi->hdr_parsing_completed)
 			/* More header content on the way */
 			goto read_ok;
 
 		switch (wsi->state) {
-			case WSI_STATE_HTTP:
-			case WSI_STATE_HTTP_HEADERS:
-				goto http_complete;
-			case WSI_STATE_HTTP_ISSUING_FILE:
+			case LWSS_HTTP:
+			case LWSS_HTTP_HEADERS:
 				goto read_ok;
-			case WSI_STATE_HTTP_BODY:
-				wsi->u.http.content_remain = wsi->u.http.content_length;
-				goto http_postbody;
+			case LWSS_HTTP_ISSUING_FILE:
+				goto read_ok;
+			case LWSS_HTTP_BODY:
+				wsi->u.http.content_remain =
+						wsi->u.http.content_length;
+				if (wsi->u.http.content_remain)
+					goto http_postbody;
+
+				/* there is no POST content */
+				goto postbody_completion;
 			default:
 				break;
 		}
 		break;
 
-	case WSI_STATE_HTTP_BODY:
+	case LWSS_HTTP_BODY:
 http_postbody:
 		while (len && wsi->u.http.content_remain) {
 			/* Copy as much as possible, up to the limit of:
@@ -141,44 +156,68 @@ http_postbody:
 			body_chunk_len = min(wsi->u.http.content_remain,len);
 			wsi->u.http.content_remain -= body_chunk_len;
 			len -= body_chunk_len;
+#ifdef LWS_WITH_CGI
+			if (wsi->cgi) {
+				struct lws_cgi_args args;
 
-			if (wsi->protocol->callback) {
-				n = wsi->protocol->callback(
-					wsi->protocol->owning_server, wsi,
+				args.ch = LWS_STDIN;
+				args.stdwsi = &wsi->cgi->stdwsi[0];
+				args.data = buf;
+				args.len = body_chunk_len;
+
+				/* returns how much used */
+				n = user_callback_handle_rxflow(
+					wsi->protocol->callback,
+					wsi, LWS_CALLBACK_CGI_STDIN_DATA,
+					wsi->user_space,
+					(void *)&args, 0);
+				if ((int)n < 0)
+					goto bail;
+			} else {
+#endif
+				n = wsi->protocol->callback(wsi,
 					LWS_CALLBACK_HTTP_BODY, wsi->user_space,
 					buf, body_chunk_len);
 				if (n)
 					goto bail;
+				n = body_chunk_len;
+#ifdef LWS_WITH_CGI
 			}
-			buf += body_chunk_len;
+#endif
+			buf += n;
 
-			if (!wsi->u.http.content_remain)  {
-				/* he sent the content in time */
-				libwebsocket_set_timeout(wsi, NO_PENDING_TIMEOUT, 0);
-				if (wsi->protocol->callback) {
-					n = wsi->protocol->callback(
-						wsi->protocol->owning_server, wsi,
-						LWS_CALLBACK_HTTP_BODY_COMPLETION,
-						wsi->user_space, NULL, 0);
-					if (n)
-						goto bail;
-				}
-				goto http_complete;
-			} else
-				libwebsocket_set_timeout(wsi,
-					PENDING_TIMEOUT_HTTP_CONTENT,
-					AWAITING_TIMEOUT);
+			if (wsi->u.http.content_remain)  {
+				lws_set_timeout(wsi, PENDING_TIMEOUT_HTTP_CONTENT,
+						wsi->context->timeout_secs);
+				break;
+			}
+			/* he sent all the content in time */
+postbody_completion:
+			lws_set_timeout(wsi, NO_PENDING_TIMEOUT, 0);
+#ifdef LWS_WITH_CGI
+			if (!wsi->cgi)
+#endif
+			{
+				n = wsi->protocol->callback(wsi,
+					LWS_CALLBACK_HTTP_BODY_COMPLETION,
+					wsi->user_space, NULL, 0);
+				if (n)
+					goto bail;
+			}
+
+			goto http_complete;
 		}
 		break;
 
-	case WSI_STATE_ESTABLISHED:
-	case WSI_STATE_AWAITING_CLOSE_ACK:
+	case LWSS_ESTABLISHED:
+	case LWSS_AWAITING_CLOSE_ACK:
+	case LWSS_SHUTDOWN:
 		if (lws_handshake_client(wsi, &buf, len))
 			goto bail;
 		switch (wsi->mode) {
-		case LWS_CONNMODE_WS_SERVING:
+		case LWSCM_WS_SERVING:
 
-			if (libwebsocket_interpret_incoming_packet(wsi, buf, len) < 0) {
+			if (lws_interpret_incoming_packet(wsi, &buf, len) < 0) {
 				lwsl_info("interpret_incoming_packet has bailed\n");
 				goto bail;
 			}
@@ -186,47 +225,33 @@ http_postbody:
 		}
 		break;
 	default:
-		lwsl_err("libwebsocket_read: Unhandled state\n");
+		lwsl_err("%s: Unhandled state\n", __func__);
 		break;
 	}
 
 read_ok:
-	/* Nothing more to do for now. */
-	lwsl_debug("libwebsocket_read: read_ok\n");
+	/* Nothing more to do for now */
+	lwsl_info("%s: read_ok, used %d\n", __func__, buf - oldbuf);
 
-	return 0;
+	return buf - oldbuf;
 
 http_complete:
-	lwsl_debug("libwebsocket_read: http_complete\n");
+	lwsl_debug("%s: http_complete\n", __func__);
 
+#ifndef LWS_NO_SERVER
 	/* Did the client want to keep the HTTP connection going? */
-
-	if (wsi->u.http.connection_type == HTTP_CONNECTION_KEEP_ALIVE) {
-		lwsl_debug("libwebsocket_read: keep-alive\n");
-		wsi->state = WSI_STATE_HTTP;
-		wsi->mode = LWS_CONNMODE_HTTP_SERVING;
-
-		/* He asked for it to stay alive indefinitely */
-		libwebsocket_set_timeout(wsi, NO_PENDING_TIMEOUT, 0);
-
-		if (lws_allocate_header_table(wsi))
-			goto bail;
-
-		/* If we're (re)starting on headers, need other implied init */
-		wsi->u.hdr.ues = URIES_IDLE;
-
-		/* If we have more data, loop back around: */
-		if (len)
-			goto http_new;
-
-		return 0;
-	}
+	if (lws_http_transaction_completed(wsi))
+		goto bail;
+#endif
+	/* we may have next header set already, but return to event loop first
+	 * so a heaily-pipelined http/1.1 connection cannot monopolize the
+	 * service thread with GET hugefile.bin GET hugefile.bin etc
+	 */
+	goto read_ok;
 
 bail:
-	lwsl_debug("closing connection at libwebsocket_read bail:\n");
-
-	libwebsocket_close_and_free_session(context, wsi,
-						     LWS_CLOSE_STATUS_NOSTATUS);
+	lwsl_debug("closing connection at lws_read bail:\n");
+	lws_close_free_wsi(wsi, LWS_CLOSE_STATUS_NOSTATUS);
 
 	return -1;
 }

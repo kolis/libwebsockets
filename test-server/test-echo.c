@@ -1,25 +1,21 @@
 /*
- * libwebsockets-test-echo - libwebsockets echo test implementation
+ * libwebsockets-test-echo
  *
- * This implements both the client and server sides.  It defaults to
- * serving, use --client <remote address> to connect as client.
+ * Copyright (C) 2010-2016 Andy Green <andy@warmcat.com>
  *
- * Copyright (C) 2010-2013 Andy Green <andy@warmcat.com>
+ * This file is made available under the Creative Commons CC0 1.0
+ * Universal Public Domain Dedication.
  *
- *  This library is free software; you can redistribute it and/or
- *  modify it under the terms of the GNU Lesser General Public
- *  License as published by the Free Software Foundation:
- *  version 2.1 of the License.
+ * The person who associated a work with this deed has dedicated
+ * the work to the public domain by waiving all of his or her rights
+ * to the work worldwide under copyright law, including all related
+ * and neighboring rights, to the extent allowed by law. You can copy,
+ * modify, distribute and perform the work, even for commercial purposes,
+ * all without asking permission.
  *
- *  This library is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- *  Lesser General Public License for more details.
- *
- *  You should have received a copy of the GNU Lesser General Public
- *  License along with this library; if not, write to the Free Software
- *  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
- *  MA  02110-1301  USA
+ * The test apps are intended to be adapted for use in your code, which
+ * may be proprietary.  So unlike the library itself, they are licensed
+ * Public Domain.
  */
 
 #include <stdio.h>
@@ -29,45 +25,65 @@
 #include <assert.h>
 #include <signal.h>
 
+#include "../lib/libwebsockets.h"
+
 #ifndef _WIN32
 #include <syslog.h>
 #include <sys/time.h>
 #include <unistd.h>
+#else
+#include "gettimeofday.h"
+#include <process.h>
 #endif
-
-#include "lws_config.h"
-
-#include "../lib/libwebsockets.h"
 
 static volatile int force_exit = 0;
 static int versa, state;
+static int times = -1;
 
-#define MAX_ECHO_PAYLOAD 1400
 #define LOCAL_RESOURCE_PATH INSTALL_DATADIR"/libwebsockets-test-server"
 
+#define MAX_ECHO_PAYLOAD 1024
+
 struct per_session_data__echo {
-	unsigned char buf[LWS_SEND_BUFFER_PRE_PADDING + MAX_ECHO_PAYLOAD + LWS_SEND_BUFFER_POST_PADDING];
+	size_t rx, tx;
+	unsigned char buf[LWS_PRE + MAX_ECHO_PAYLOAD];
 	unsigned int len;
 	unsigned int index;
+	int final;
+	int continuation;
+	int binary;
 };
 
 static int
-callback_echo(struct libwebsocket_context *context,
-		struct libwebsocket *wsi,
-		enum libwebsocket_callback_reasons reason, void *user,
-							   void *in, size_t len)
+callback_echo(struct lws *wsi, enum lws_callback_reasons reason, void *user,
+	      void *in, size_t len)
 {
-	struct per_session_data__echo *pss = (struct per_session_data__echo *)user;
+	struct per_session_data__echo *pss =
+			(struct per_session_data__echo *)user;
 	int n;
 
 	switch (reason) {
 
 #ifndef LWS_NO_SERVER
-	/* when the callback is used for server operations --> */
 
 	case LWS_CALLBACK_SERVER_WRITEABLE:
 do_tx:
-		n = libwebsocket_write(wsi, &pss->buf[LWS_SEND_BUFFER_PRE_PADDING], pss->len, LWS_WRITE_TEXT);
+
+		n = LWS_WRITE_CONTINUATION;
+		if (!pss->continuation) {
+			if (pss->binary)
+				n = LWS_WRITE_BINARY;
+			else
+				n = LWS_WRITE_TEXT;
+			pss->continuation = 1;
+		}
+		if (!pss->final)
+			n |= LWS_WRITE_NO_FIN;
+		lwsl_info("+++ test-echo: writing %d, with final %d\n",
+			  pss->len, pss->final);
+
+		pss->tx += pss->len;
+		n = lws_write(wsi, &pss->buf[LWS_PRE], pss->len, n);
 		if (n < 0) {
 			lwsl_err("ERROR %d writing to socket, hanging up\n", n);
 			return 1;
@@ -76,17 +92,26 @@ do_tx:
 			lwsl_err("Partial write\n");
 			return -1;
 		}
+		pss->len = -1;
+		if (pss->final)
+			pss->continuation = 0;
+		lws_rx_flow_control(wsi, 1);
 		break;
 
 	case LWS_CALLBACK_RECEIVE:
 do_rx:
-		if (len > MAX_ECHO_PAYLOAD) {
-			lwsl_err("Server received packet bigger than %u, hanging up\n", MAX_ECHO_PAYLOAD);
-			return 1;
-		}
-		memcpy(&pss->buf[LWS_SEND_BUFFER_PRE_PADDING], in, len);
+		pss->final = lws_is_final_fragment(wsi);
+		pss->binary = lws_frame_is_binary(wsi);
+		lwsl_info("+++ test-echo: RX len %d final %d, pss->len=%d\n",
+			  len, pss->final, (int)pss->len);
+
+		memcpy(&pss->buf[LWS_PRE], in, len);
+		assert((int)pss->len == -1);
 		pss->len = (unsigned int)len;
-		libwebsocket_callback_on_writable(context, wsi);
+		pss->rx += len;
+
+		lws_rx_flow_control(wsi, 0);
+		lws_callback_on_writable(wsi);
 		break;
 #endif
 
@@ -95,13 +120,14 @@ do_rx:
 
 	case LWS_CALLBACK_CLOSED:
 	case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
-		lwsl_info("closed\n");
+		lwsl_debug("closed\n");
 		state = 0;
 		break;
 
 	case LWS_CALLBACK_CLIENT_ESTABLISHED:
-		lwsl_notice("Client has connected\n");
+		lwsl_debug("Client has connected\n");
 		pss->index = 0;
+		pss->len = -1;
 		state = 2;
 		break;
 
@@ -115,13 +141,18 @@ do_rx:
 
 	case LWS_CALLBACK_CLIENT_WRITEABLE:
 #ifndef LWS_NO_SERVER
-		if (versa)
-			goto do_tx;
+		if (versa) {
+			if (pss->len != (unsigned int)-1)
+				goto do_tx;
+			break;
+		}
 #endif
 		/* we will send our packet... */
-		pss->len = sprintf((char *)&pss->buf[LWS_SEND_BUFFER_PRE_PADDING], "hello from libwebsockets-test-echo client pid %d index %d\n", getpid(), pss->index++);
-		lwsl_notice("Client TX: %s", &pss->buf[LWS_SEND_BUFFER_PRE_PADDING]);
-		n = libwebsocket_write(wsi, &pss->buf[LWS_SEND_BUFFER_PRE_PADDING], pss->len, LWS_WRITE_TEXT);
+		pss->len = sprintf((char *)&pss->buf[LWS_PRE],
+				   "hello from libwebsockets-test-echo client pid %d index %d\n",
+				   getpid(), pss->index++);
+		lwsl_notice("Client TX: %s", &pss->buf[LWS_PRE]);
+		n = lws_write(wsi, &pss->buf[LWS_PRE], pss->len, LWS_WRITE_TEXT);
 		if (n < 0) {
 			lwsl_err("ERROR %d writing to socket, hanging up\n", n);
 			return -1;
@@ -131,10 +162,13 @@ do_rx:
 			return -1;
 		}
 		break;
-	case LWS_CALLBACK_OPENSSL_LOAD_EXTRA_CLIENT_VERIFY_CERTS:
-		
-		break;
 #endif
+	case LWS_CALLBACK_CLIENT_CONFIRM_EXTENSION_SUPPORTED:
+		/* reject everything else except permessage-deflate */
+		if (strcmp(in, "permessage-deflate"))
+			return 1;
+		break;
+
 	default:
 		break;
 	}
@@ -144,18 +178,34 @@ do_rx:
 
 
 
-static struct libwebsocket_protocols protocols[] = {
+static struct lws_protocols protocols[] = {
 	/* first protocol must always be HTTP handler */
 
 	{
-		"default",		/* name */
-		callback_echo,		/* callback */
-		sizeof(struct per_session_data__echo)	/* per_session_data_size */
+		"",		/* name - can be overriden with -e */
+		callback_echo,
+		sizeof(struct per_session_data__echo),	/* per_session_data_size */
+		MAX_ECHO_PAYLOAD,
 	},
 	{
 		NULL, NULL, 0		/* End of list */
 	}
 };
+
+static const struct lws_extension exts[] = {
+	{
+		"permessage-deflate",
+		lws_extension_callback_pm_deflate,
+		"permessage-deflate; client_no_context_takeover; client_max_window_bits"
+	},
+	{
+		"deflate-frame",
+		lws_extension_callback_pm_deflate,
+		"deflate_frame"
+	},
+	{ NULL, NULL, NULL /* terminator */ }
+};
+
 
 void sighandler(int sig)
 {
@@ -177,6 +227,8 @@ static struct option options[] = {
 	{ "uri",	required_argument,	NULL, 'u' },
 	{ "passphrase", required_argument,	NULL, 'P' },
 	{ "interface",  required_argument,	NULL, 'i' },
+	{ "times",	required_argument,	NULL, 'n' },
+	{ "echogen",	no_argument,		NULL, 'e' },
 #ifndef LWS_NO_DAEMONIZE
 	{ "daemonize", 	no_argument,		NULL, 'D' },
 #endif
@@ -188,13 +240,13 @@ int main(int argc, char **argv)
 	int n = 0;
 	int port = 7681;
 	int use_ssl = 0;
-	struct libwebsocket_context *context;
+	struct lws_context *context;
 	int opts = 0;
 	char interface_name[128] = "";
-	const char *interface = NULL;
+	const char *_interface = NULL;
 	char ssl_cert[256] = LOCAL_RESOURCE_PATH"/libwebsockets-test-server.pem";
 	char ssl_key[256] = LOCAL_RESOURCE_PATH"/libwebsockets-test-server.key.pem";
-#ifndef WIN32
+#ifndef _WIN32
 	int syslog_options = LOG_PID | LOG_PERROR;
 #endif
 	int client = 0;
@@ -205,9 +257,12 @@ int main(int argc, char **argv)
 #ifndef LWS_NO_CLIENT
 	char address[256], ads_port[256 + 30];
 	int rate_us = 250000;
-	unsigned int oldus = 0;
-	struct libwebsocket *wsi;
+	unsigned long long oldus;
+	struct lws *wsi;
 	int disallow_selfsigned = 0;
+	struct timeval tv;
+	const char *connect_protocol = NULL;
+	struct lws_client_connect_info i;
 #endif
 
 	int debug_level = 7;
@@ -225,7 +280,7 @@ int main(int argc, char **argv)
 #endif
 
 	while (n >= 0) {
-		n = getopt_long(argc, argv, "i:hsp:d:DC:k:P:vu:"
+		n = getopt_long(argc, argv, "i:hsp:d:DC:k:P:vu:n:e"
 #ifndef LWS_NO_CLIENT
 			"c:r:"
 #endif
@@ -251,11 +306,11 @@ int main(int argc, char **argv)
 			strncpy(uri, optarg, sizeof(uri));
 			uri[sizeof(uri) - 1] = '\0';
 			break;
-			
+
 #ifndef LWS_NO_DAEMONIZE
 		case 'D':
 			daemonize = 1;
-#ifndef WIN32
+#ifndef _WIN32
 			syslog_options &= ~LOG_PERROR;
 #endif
 			break;
@@ -283,10 +338,18 @@ int main(int argc, char **argv)
 		case 'v':
 			versa = 1;
 			break;
+		case 'e':
+			protocols[0].name = "lws-echogen";
+			connect_protocol = protocols[0].name;
+			lwsl_err("using lws-echogen\n");
+			break;
 		case 'i':
 			strncpy(interface_name, optarg, sizeof interface_name);
 			interface_name[(sizeof interface_name) - 1] = '\0';
-			interface = interface_name;
+			_interface = interface_name;
+			break;
+		case 'n':
+			times = atoi(optarg);
 			break;
 		case '?':
 		case 'h':
@@ -302,6 +365,8 @@ int main(int argc, char **argv)
 				"  --ssl        / -s\n"
 				"  --passphrase / -P <passphrase>\n"
 				"  --interface  / -i <interface>\n"
+				"  --uri        / -u <uri path>\n"
+				"  --times      / -n <-1 unlimited or times to echo>\n"
 #ifndef LWS_NO_DAEMONIZE
 				"  --daemonize  / -D\n"
 #endif
@@ -310,7 +375,7 @@ int main(int argc, char **argv)
 		}
 	}
 
-#ifndef LWS_NO_DAEMONIZE 
+#ifndef LWS_NO_DAEMONIZE
 	/*
 	 * normally lock path would be /var/lock/lwsts or similar, to
 	 * simplify getting started without having to take care about
@@ -325,18 +390,18 @@ int main(int argc, char **argv)
 #endif
 #endif
 
-#ifdef WIN32
-#else
+#ifndef _WIN32
 	/* we will only try to log things according to our debug_level */
 	setlogmask(LOG_UPTO (LOG_DEBUG));
 	openlog("lwsts", syslog_options, LOG_DAEMON);
+#endif
 
 	/* tell the library what debug level to emit and to send it to syslog */
 	lws_set_log_level(debug_level, lwsl_emit_syslog);
-#endif
-	lwsl_notice("libwebsockets echo test - "
-		    "(C) Copyright 2010-2015 Andy Green <andy@warmcat.com> - "
-		    "licensed under LGPL2.1\n");
+
+	lwsl_notice("libwebsockets test server echo - license LGPL2.1+SLE\n");
+	lwsl_notice("(C) Copyright 2010-2016 Andy Green <andy@warmcat.com>\n");
+
 #ifndef LWS_NO_CLIENT
 	if (client) {
 		lwsl_notice("Running in client mode\n");
@@ -345,7 +410,8 @@ int main(int argc, char **argv)
 			lwsl_info("allowing selfsigned\n");
 			use_ssl = 2;
 		} else {
-			lwsl_info("requiring server cert validation againts %s\n", ssl_cert);
+			lwsl_info("requiring server cert validation against %s\n",
+				  ssl_cert);
 			info.ssl_ca_filepath = ssl_cert;
 		}
 	} else {
@@ -359,11 +425,8 @@ int main(int argc, char **argv)
 #endif
 
 	info.port = listen_port;
-	info.iface = interface;
+	info.iface = _interface;
 	info.protocols = protocols;
-#ifndef LWS_NO_EXTENSIONS
-	info.extensions = libwebsocket_get_internal_extensions();
-#endif
 	if (use_ssl && !client) {
 		info.ssl_cert_filepath = ssl_cert;
 		info.ssl_private_key_filepath = ssl_key;
@@ -374,9 +437,15 @@ int main(int argc, char **argv)
 		}
 	info.gid = -1;
 	info.uid = -1;
-	info.options = opts;
+	info.options = opts | LWS_SERVER_OPTION_VALIDATE_UTF8;
 
-	context = libwebsocket_create_context(&info);
+	if (use_ssl)
+		info.options |= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+#ifndef LWS_NO_EXTENSIONS
+	info.extensions = exts;
+#endif
+
+	context = lws_create_context(&info);
 	if (context == NULL) {
 		lwsl_err("libwebsocket init failed\n");
 		return -1;
@@ -385,47 +454,69 @@ int main(int argc, char **argv)
 
 	signal(SIGINT, sighandler);
 
+#ifndef LWS_NO_CLIENT
+	gettimeofday(&tv, NULL);
+	oldus = ((unsigned long long)tv.tv_sec * 1000000) + tv.tv_usec;
+#endif
+
 	n = 0;
 	while (n >= 0 && !force_exit) {
 #ifndef LWS_NO_CLIENT
-		struct timeval tv;
-
-		if (client && !state) {
+		if (client && !state && times) {
 			state = 1;
-			lwsl_notice("Client connecting to %s:%u....\n", address, port);
+			lwsl_notice("Client connecting to %s:%u....\n",
+				    address, port);
 			/* we are in client mode */
-		
+
 			address[sizeof(address) - 1] = '\0';
 			sprintf(ads_port, "%s:%u", address, port & 65535);
-		
-			wsi = libwebsocket_client_connect(context, address,
-				port, use_ssl, uri, ads_port,
-				 ads_port, NULL, -1);
+			if (times > 0)
+				times--;
+
+			memset(&i, 0, sizeof(i));
+
+			i.context = context;
+			i.address = address;
+			i.port = port;
+			i.ssl_connection = use_ssl;
+			i.path = uri;
+			i.host = ads_port;
+			i.origin = ads_port;
+			i.protocol = connect_protocol;
+			i.client_exts = exts;
+
+			wsi = lws_client_connect_via_info(&i);
 			if (!wsi) {
-				lwsl_err("Client failed to connect to %s:%u\n", address, port);
+				lwsl_err("Client failed to connect to %s:%u\n",
+					 address, port);
 				goto bail;
 			}
 		}
 
-		if (client && !versa) {
+		if (client && !versa && times) {
 			gettimeofday(&tv, NULL);
 
-			if (((unsigned int)tv.tv_usec - oldus) > (unsigned int)rate_us) {
-				libwebsocket_callback_on_writable_all_protocol(&protocols[0]);
-				oldus = tv.tv_usec;
+			if (((((unsigned long long)tv.tv_sec * 1000000) + tv.tv_usec) - oldus) > rate_us) {
+				lws_callback_on_writable_all_protocol(context,
+						&protocols[0]);
+				oldus = ((unsigned long long)tv.tv_sec * 1000000) + tv.tv_usec;
+				if (times > 0)
+					times--;
 			}
 		}
+
+		if (client && !state && !times)
+			break;
 #endif
-		n = libwebsocket_service(context, 10);
+		n = lws_service(context, 10);
 	}
 #ifndef LWS_NO_CLIENT
 bail:
 #endif
-	libwebsocket_context_destroy(context);
+	lws_context_destroy(context);
 
 	lwsl_notice("libwebsockets-test-echo exited cleanly\n");
-#ifdef WIN32
-#else
+#ifndef _WIN32
 	closelog();
 #endif
 

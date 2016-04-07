@@ -10,9 +10,10 @@ create elaborate clean scripts to get a clean source tree, instead you
 simply remove your build directory.
 
 Libwebsockets has been tested to build successfully on the following platforms
-with SSL support (both OpenSSL/CyaSSL):
+with SSL support (both OpenSSL/wolfSSL):
 
-- Windows
+- Windows (Visual Studio)
+- Windows (MinGW)
 - Linux (x86 and ARM)
 - OSX
 - NetBSD
@@ -85,12 +86,19 @@ Building on Unix:
 	$ LD_LIBRARY_PATH=/usr/local/ssl/lib libwebsockets-test-server --ssl
     ```
 
+	**NOTE5**:
+	To build with debug info and _DEBUG for lower priority debug messages
+	compiled in, use
+
+    ```bash
+	$ cmake .. -DCMAKE_BUILD_TYPE=DEBUG
+    ````
+
 4. Finally you can build using the generated Makefile:
 
     ```bash
 	$ make
     ```
-
 
 Quirk of cmake
 --------------
@@ -99,14 +107,18 @@ When changing cmake options, for some reason the only way to get it to see the
 changes sometimes is delete the contents of your build directory and do the
 cmake from scratch.
 
-
 Building on Windows (Visual Studio)
 -----------------------------------
 1. Install CMake 2.6 or greater: http://cmake.org/cmake/resources/software.html
 
 2. Install OpenSSL binaries. http://www.openssl.org/related/binaries.html
-   (Preferably in the default location to make it easier for CMake to find them)
 
+   (**NOTE**: Preferably in the default location to make it easier for CMake to find them)
+
+   **NOTE2**: 
+   Be sure that OPENSSL_CONF environment variable is defined and points at 
+   <OpenSSL install location>\bin\openssl.cfg
+	 
 3. Generate the Visual studio project by opening the Visual Studio cmd prompt:
 
    ```bash
@@ -117,9 +129,91 @@ Building on Windows (Visual Studio)
    ```
 
    (**NOTE**: There is also a cmake-gui available on Windows if you prefer that)
+   
+   **NOTE2**:
+   See this link to find out the version number corresponding to your Visual Studio edition:
+   http://superuser.com/a/194065
 
 4. Now you should have a generated Visual Studio Solution in  your
    `<path to src>/build` directory, which can be used to build.
+
+5. Some additional deps may be needed
+
+ - iphlpapi.lib
+ - psapi.lib
+ - userenv.lib
+
+6. If you're using libuv, you must make sure to compile libuv with the same multithread-dll / Mtd attributes as libwebsockets itself
+
+
+Building on Windows (MinGW)
+---------------------------
+1. Install MinGW: http://sourceforge.net/projects/mingw/files
+
+   (**NOTE**: Preferably in the default location C:\MinGW)
+
+2. Fix up MinGW headers
+
+   a) Add the following lines to C:\MinGW\include\winsock2.h:
+   
+   ```c
+   #if(_WIN32_WINNT >= 0x0600)
+
+   typedef struct pollfd {
+
+       SOCKET  fd;
+       SHORT   events;
+       SHORT   revents;
+
+   } WSAPOLLFD, *PWSAPOLLFD, FAR *LPWSAPOLLFD;
+
+   WINSOCK_API_LINKAGE int WSAAPI WSAPoll(LPWSAPOLLFD fdArray, ULONG fds, INT timeout);
+
+   #endif // (_WIN32_WINNT >= 0x0600)
+   ```
+
+   b) Create C:\MinGW\include\mstcpip.h and copy and paste the content from following link into it:
+    
+   http://wine-unstable.sourcearchive.com/documentation/1.1.32/mstcpip_8h-source.html
+
+3. Install CMake 2.6 or greater: http://cmake.org/cmake/resources/software.html
+
+4. Install OpenSSL binaries. http://www.openssl.org/related/binaries.html
+
+   (**NOTE**: Preferably in the default location to make it easier for CMake to find them)
+
+   **NOTE2**: 
+   Be sure that OPENSSL_CONF environment variable is defined and points at 
+   <OpenSSL install location>\bin\openssl.cfg
+
+5. Generate the build files (default is Make files) using MSYS shell:
+
+   ```bash
+   $ cd /drive/path/to/src
+   $ mkdir build
+   $ cd build
+   $ cmake -G "MSYS Makefiles" -DCMAKE_INSTALL_PREFIX=C:/MinGW ..
+   ```
+
+   (**NOTE**: The `build/`` directory can have any name and be located anywhere
+    on your filesystem, and that the argument `..` given to cmake is simply
+    the source directory of **libwebsockets** containing the [CMakeLists.txt](CMakeLists.txt)
+    project file. All examples in this file assumes you use "..")
+
+   **NOTE2**:
+   To generate build files allowing to create libwebsockets binaries with debug information
+   set the CMAKE_BUILD_TYPE flag to DEBUG:
+
+   ```bash
+   $ cmake -G "MSYS Makefiles" -DCMAKE_INSTALL_PREFIX=C:/MinGW -DCMAKE_BUILD_TYPE=DEBUG ..
+   ```
+
+6. Finally you can build using the generated Makefile and get the results deployed into your MinGW installation:
+
+   ```bash
+   $ make
+   $ make install
+   ```
 
 Setting compile options
 -----------------------
@@ -139,9 +233,52 @@ Then to set an option and build (for example turn off SSL support):
 or
 	cmake -DLWS_WITH_SSL:BOOL=OFF ..
 
+Building on mbed3
+-----------------
+MBED3 is a non-posix embedded OS targeted on Cortex M class chips.
+
+https://www.mbed.com/
+
+It's quite unlike any other Posixy platform since the OS is linked statically
+in with lws to form one binary.
+
+At the minute server-only is supported and due to bugs in mbed3 network support,
+the port is of alpha quality.  However it can serve the test html, favicon.ico
+and logo png and may be able to make ws connections.  The binary for that
+including the OS, test app, lws and all the assets is only 117KB.
+
+0) Today mbed3 only properly works on FRDM K64F $35 Freescale Dev Board with
+1MB Flash, 256KB SRAM and Ethernet.
+
+http://www.freescale.com/products/arm-processors/kinetis-cortex-m/k-series/k6x-ethernet-mcus/freescale-freedom-development-platform-for-kinetis-k64-k63-and-k24-mcus:FRDM-K64F
+
+1) Get a working mbed3 environment with arm-none-eabi-cs toolchain
+(available in Fedora, Ubuntu and other distros)
+
+2) Confirm you can build things using yotta by following the getting started guide here
+
+https://docs.mbed.com/docs/getting-started-mbed-os/en/latest/
+
+3)
+
+git clone https://github.com/warmcat/lws-test-server
+
+and cd into it
+
+4) mkdir -p yotta_modules ; cd yotta_modules
+
+5) git clone https://github.com/warmcat/libwebsockets ; mv libwebsockets websockets ; cd ..
+
+6) yotta target frdm-k64f-gcc
+
+7) yotta install
+
+8) yotta build
+
+
 Unix GUI
 --------
-If you have a curses enabled build you simply type:
+If you have a curses-enabled build you simply type:
 (not all packages include this, my debian install does not for example).
 
 	ccmake
@@ -151,16 +288,27 @@ Windows GUI
 On windows CMake comes with a gui application:
 	Start -> Programs -> CMake -> CMake (cmake-gui)
 
-CyaSSL replacement for OpenSSL
-------------------------------
-CyaSSL is a lightweight SSL library targeted at embedded system:
-http://www.yassl.com/yaSSL/Products-cyassl.html
+wolfSSL/CyaSSL replacement for OpenSSL
+--------------------------------------
+wolfSSL/CyaSSL is a lightweight SSL library targeted at embedded systems:
+https://www.wolfssl.com/wolfSSL/Products-wolfssl.html
 
-It contains a OpenSSL compatability layer which makes it possible to pretty
+It contains a OpenSSL compatibility layer which makes it possible to pretty
 much link to it instead of OpenSSL, giving a much smaller footprint.
 
-**NOTE**: cyassl needs to be compiled using the `--enable-opensslextra` flag for
+**NOTE**: wolfssl needs to be compiled using the `--enable-opensslextra` flag for
 this to work.
+
+Compiling libwebsockets with wolfSSL
+------------------------------------
+
+```bash
+cmake .. -DLWS_USE_WOLFSSL=1 \
+	 -DLWS_WOLFSSL_INCLUDE_DIRS=/path/to/wolfssl \
+	 -DLWS_WOLFSSL_LIBRARIES=/path/to/wolfssl/wolfssl.a ..
+```
+
+**NOTE**: On windows use the .lib file extension for `LWS_WOLFSSL_LIBRARIES` instead.
 
 Compiling libwebsockets with CyaSSL
 -----------------------------------
@@ -168,11 +316,10 @@ Compiling libwebsockets with CyaSSL
 ```bash
 cmake .. -DLWS_USE_CYASSL=1 \
 	 -DLWS_CYASSL_INCLUDE_DIRS=/path/to/cyassl \
-	 -DLWS_CYASSL_LIB=/path/to/cyassl/cyassl.a ..
+	 -DLWS_CYASSL_LIBRARIES=/path/to/wolfssl/cyassl.a ..
 ```
 
-**NOTE**: On windows use the .lib file extension for `LWS_CYASSL_LIB` instead.
-
+**NOTE**: On windows use the .lib file extension for `LWS_CYASSL_LIBRARIES` instead.
 
 Reproducing HTTP2.0 tests
 -------------------------
@@ -203,7 +350,7 @@ $ nghttp -nvas https://localhost:7681/test.html
 
 Cross compiling
 ---------------
-To enable cross compiling **libwebsockets** using CMake you need to create
+To enable cross-compiling **libwebsockets** using CMake you need to create
 a "Toolchain file" that you supply to CMake when generating your build files.
 CMake will then use the cross compilers and build paths specified in this file
 to look for dependencies and such.
@@ -227,7 +374,6 @@ need to provide the cross libraries otherwise.
 
 Additional information on cross compilation with CMake:
 	http://www.vtk.org/Wiki/CMake_Cross_Compiling
-
 
 Memory efficiency
 -----------------

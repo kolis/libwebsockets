@@ -7,7 +7,8 @@
  * he replied it is Public Domain.  Use the URL above to get the original
  * Public Domain version if you want it.
  *
- * This version is LGPL2 and is (c)2006 - 2013 Andy Green <andy@warmcat.com>
+ * This version is LGPL2.1+SLE like the rest of libwebsockets and is
+ * Copyright (c)2006 - 2013 Andy Green <andy@warmcat.com>
  */
 
 #include <stdlib.h>
@@ -34,15 +35,13 @@ int get_daemonize_pid()
 static void
 child_handler(int signum)
 {
-	int fd;
-	int len;
-	int sent;
+	int fd, len, sent;
 	char sz[20];
 
 	switch (signum) {
 
-	case SIGALRM: /* timedout daemonizing */
-		exit(1);
+	case SIGALRM: /* timed out daemonizing */
+		exit(0);
 		break;
 
 	case SIGUSR1: /* positive confirmation we daemonized well */
@@ -53,20 +52,21 @@ child_handler(int signum)
 			fprintf(stderr,
 			   "unable to create lock file %s, code=%d (%s)\n",
 				lock_path, errno, strerror(errno));
-			exit(1);
+			exit(5);
 		}
 		len = sprintf(sz, "%u", pid_daemon);
 		sent = write(fd, sz, len);
 		if (sent != len)
 			fprintf(stderr,
-			  "unable write pid to lock file %s, code=%d (%s)\n",
+			  "unable to write pid to lock file %s, code=%d (%s)\n",
 					     lock_path, errno, strerror(errno));
 
 		close(fd);
-		exit(!!(sent == len));
+		exit(0);
+		//!!(sent == len));
 
 	case SIGCHLD: /* daemonization failed */
-		exit(1);
+		exit(6);
 		break;
 	}
 }
@@ -76,7 +76,7 @@ static void lws_daemon_closing(int sigact)
 	if (getpid() == pid_daemon)
 		if (lock_path) {
 			unlink(lock_path);
-			lws_free2(lock_path);
+			lws_free_set_NULL(lock_path);
 		}
 
 	kill(getpid(), SIGKILL);
@@ -93,15 +93,14 @@ static void lws_daemon_closing(int sigact)
 LWS_VISIBLE int
 lws_daemonize(const char *_lock_path)
 {
-	pid_t sid, parent;
-	int fd;
-	char buf[10];
-	int n, ret;
 	struct sigaction act;
+	pid_t sid, parent;
+	int n, fd, ret;
+	char buf[10];
 
 	/* already a daemon */
-	if (getppid() == 1)
-		return 1;
+//	if (getppid() == 1)
+//		return 1;
 
 	fd = open(_lock_path, O_RDONLY);
 	if (fd >= 0) {
@@ -130,7 +129,7 @@ lws_daemonize(const char *_lock_path)
 	}
 	strcpy(lock_path, _lock_path);
 
-	/* Trap signals that we expect to recieve */
+	/* Trap signals that we expect to receive */
 	signal(SIGCHLD, child_handler);	/* died */
 	signal(SIGUSR1, child_handler); /* was happy */
 	signal(SIGALRM, child_handler); /* timeout daemonizing */
@@ -140,7 +139,7 @@ lws_daemonize(const char *_lock_path)
 	if (pid_daemon < 0) {
 		fprintf(stderr, "unable to fork daemon, code=%d (%s)",
 		    errno, strerror(errno));
-		exit(1);
+		exit(9);
 	}
 
 	/* If we got a good PID, then we can exit the parent process. */
@@ -155,7 +154,7 @@ lws_daemonize(const char *_lock_path)
 
 		pause();
 		/* should not be reachable */
-		exit(1);
+		exit(0);
 	}
 
 	/* At this point we are executing as the child process */
@@ -178,7 +177,7 @@ lws_daemonize(const char *_lock_path)
 		fprintf(stderr,
 			"unable to create a new session, code %d (%s)",
 			errno, strerror(errno));
-		exit(1);
+		exit(2);
 	}
 
 	/*
@@ -189,7 +188,7 @@ lws_daemonize(const char *_lock_path)
 		fprintf(stderr,
 			"unable to change directory to %s, code %d (%s)",
 			"/", errno, strerror(errno));
-		exit(1);
+		exit(3);
 	}
 
 	/* Redirect standard files to /dev/null */

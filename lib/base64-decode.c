@@ -33,8 +33,8 @@
  *               Bob Trower 08/04/01 -- Create Version 0.00.00B
  *
  * I cleaned it up quite a bit to match the (linux kernel) style of the rest
- * of libwebsockets; this version is under LGPL2 like the rest of libwebsockets
- * since he explictly allows sublicensing, but I give the URL above so you can
+ * of libwebsockets; this version is under LGPL2.1 + SLE like the rest of lws
+ * since he explicitly allows sublicensing, but I give the URL above so you can
  * get the original with Bob's super-liberal terms directly if you prefer.
  */
 
@@ -99,7 +99,7 @@ LWS_VISIBLE int
 lws_b64_decode_string(const char *in, char *out, int out_size)
 {
 	int len;
-	int i;
+	int i, c;
 	int done = 0;
 	unsigned char v;
 	unsigned char quad[4];
@@ -110,19 +110,19 @@ lws_b64_decode_string(const char *in, char *out, int out_size)
 		for (i = 0; i < 4 && *in; i++) {
 
 			v = 0;
+			c = 0;
 			while (*in && !v) {
-
-				v = *in++;
+				c = v = *in++;
 				v = (v < 43 || v > 122) ? 0 : decode[v - 43];
 				if (v)
 					v = (v == '$') ? 0 : v - 61;
-				if (*in) {
-					len++;
-					if (v)
-						quad[i] = v - 1;
-				} else
-					quad[i] = 0;
 			}
+			if (c) {
+				len++;
+				if (v)
+					quad[i] = v - 1;
+			} else
+				quad[i] = 0;
 		}
 
 		if (out_size < (done + len - 1))
@@ -147,12 +147,13 @@ lws_b64_decode_string(const char *in, char *out, int out_size)
 	return done;
 }
 
+#if 0
 int
 lws_b64_selftest(void)
 {
 	char buf[64];
-	int n;
-	int test;
+	unsigned int n;
+	unsigned int test;
 	static const char * const plaintext[] = {
 		"sanity check base 64"
 	};
@@ -183,3 +184,4 @@ lws_b64_selftest(void)
 
 	return 0;
 }
+#endif

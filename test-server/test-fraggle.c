@@ -1,22 +1,21 @@
 /*
  * libwebsockets-test-fraggle - random fragmentation test
  *
- * Copyright (C) 2010-2011 Andy Green <andy@warmcat.com>
+ * Copyright (C) 2011-2016 Andy Green <andy@warmcat.com>
  *
- *  This library is free software; you can redistribute it and/or
- *  modify it under the terms of the GNU Lesser General Public
- *  License as published by the Free Software Foundation:
- *  version 2.1 of the License.
+ * This file is made available under the Creative Commons CC0 1.0
+ * Universal Public Domain Dedication.
  *
- *  This library is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- *  Lesser General Public License for more details.
+ * The person who associated a work with this deed has dedicated
+ * the work to the public domain by waiving all of his or her rights
+ * to the work worldwide under copyright law, including all related
+ * and neighboring rights, to the extent allowed by law. You can copy,
+ * modify, distribute and perform the work, even for commercial purposes,
+ * all without asking permission.
  *
- *  You should have received a copy of the GNU Lesser General Public
- *  License along with this library; if not, write to the Free Software
- *  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
- *  MA  02110-1301  USA
+ * The test apps are intended to be adapted for use in your code, which
+ * may be proprietary.  So unlike the library itself, they are licensed
+ * Public Domain.
  */
 
 #include <stdio.h>
@@ -53,20 +52,17 @@ struct per_session_data__fraggle {
 };
 
 static int
-callback_fraggle(struct libwebsocket_context *context,
-			struct libwebsocket *wsi,
-			enum libwebsocket_callback_reasons reason,
-					       void *user, void *in, size_t len)
+callback_fraggle(struct lws *wsi, enum lws_callback_reasons reason,
+		 void *user, void *in, size_t len)
 {
 	int n;
-	unsigned char buf[LWS_SEND_BUFFER_PRE_PADDING + 8000 +
-						  LWS_SEND_BUFFER_POST_PADDING];
+	unsigned char buf[LWS_PRE + 8000];
 	struct per_session_data__fraggle *psf = user;
 	int chunk;
 	int write_mode = LWS_WRITE_CONTINUATION;
 	unsigned long sum;
 	unsigned char *p = (unsigned char *)in;
-	unsigned char *bp = &buf[LWS_SEND_BUFFER_PRE_PADDING];
+	unsigned char *bp = &buf[LWS_PRE];
 	int ran;
 
 	switch (reason) {
@@ -76,7 +72,7 @@ callback_fraggle(struct libwebsocket_context *context,
 		fprintf(stderr, "server sees client connect\n");
 		psf->state = FRAGSTATE_START_MESSAGE;
 		/* start the ball rolling */
-		libwebsocket_callback_on_writable(context, wsi);
+		lws_callback_on_writable(wsi);
 		break;
 
 	case LWS_CALLBACK_CLIENT_ESTABLISHED:
@@ -100,13 +96,13 @@ callback_fraggle(struct libwebsocket_context *context,
 
 		case FRAGSTATE_RANDOM_PAYLOAD:
 
-			for (n = 0; n < len; n++)
+			for (n = 0; (unsigned int)n < len; n++)
 				psf->sum += p[n];
 
 			psf->total_message += len;
 			psf->packets_left++;
 
-			if (libwebsocket_is_final_fragment(wsi))
+			if (lws_is_final_fragment(wsi))
 				psf->state = FRAGSTATE_POST_PAYLOAD_SUM;
 			break;
 
@@ -136,8 +132,8 @@ callback_fraggle(struct libwebsocket_context *context,
 		switch (psf->state) {
 
 		case FRAGSTATE_START_MESSAGE:
-			libwebsockets_get_random(context, &ran, sizeof(ran));
-			psf->packets_left = (ran % 1024) + 1;
+			lws_get_random(lws_get_context(wsi), &ran, sizeof(ran));
+			psf->packets_left = (ran & 1023) + 1;
 			fprintf(stderr, "Spamming %d random fragments\n",
 							     psf->packets_left);
 			psf->sum = 0;
@@ -155,11 +151,11 @@ callback_fraggle(struct libwebsocket_context *context,
 			 * code for rx spill because the rx buffer is full
 			 */
 
-			libwebsockets_get_random(context, &ran, sizeof(ran));
-			chunk = (ran % 8000) + 1;
+			lws_get_random(lws_get_context(wsi), &ran, sizeof(ran));
+			chunk = (ran & 511) + 1;
 			psf->total_message += chunk;
 
-			libwebsockets_get_random(context, bp, chunk);
+			lws_get_random(lws_get_context(wsi), bp, chunk);
 			for (n = 0; n < chunk; n++)
 				psf->sum += bp[n];
 
@@ -169,7 +165,7 @@ callback_fraggle(struct libwebsocket_context *context,
 			else
 				psf->state = FRAGSTATE_POST_PAYLOAD_SUM;
 
-			n = libwebsocket_write(wsi, bp, chunk, write_mode);
+			n = lws_write(wsi, bp, chunk, write_mode);
 			if (n < 0)
 				return -1;
 			if (n < chunk) {
@@ -177,7 +173,7 @@ callback_fraggle(struct libwebsocket_context *context,
 				return -1;
 			}
 
-			libwebsocket_callback_on_writable(context, wsi);
+			lws_callback_on_writable(wsi);
 			break;
 
 		case FRAGSTATE_POST_PAYLOAD_SUM:
@@ -187,11 +183,11 @@ callback_fraggle(struct libwebsocket_context *context,
 						  psf->total_message, psf->sum);
 
 			bp[0] = psf->sum >> 24;
-			bp[1] = psf->sum >> 16;
-			bp[2] = psf->sum >> 8;
-			bp[3] = psf->sum;
+			bp[1] = (unsigned char)(psf->sum >> 16);
+			bp[2] = (unsigned char)(psf->sum >> 8);
+			bp[3] = (unsigned char)psf->sum;
 
-			n = libwebsocket_write(wsi, (unsigned char *)bp,
+			n = lws_write(wsi, (unsigned char *)bp,
 							   4, LWS_WRITE_BINARY);
 			if (n < 0)
 				return -1;
@@ -202,7 +198,7 @@ callback_fraggle(struct libwebsocket_context *context,
 
 			psf->state = FRAGSTATE_START_MESSAGE;
 
-			libwebsocket_callback_on_writable(context, wsi);
+			lws_callback_on_writable(wsi);
 			break;
 		}
 		break;
@@ -229,10 +225,9 @@ callback_fraggle(struct libwebsocket_context *context,
 }
 
 
-
 /* list of supported protocols and callbacks */
 
-static struct libwebsocket_protocols protocols[] = {
+static struct lws_protocols protocols[] = {
 	{
 		"fraggle-protocol",
 		callback_fraggle,
@@ -241,6 +236,20 @@ static struct libwebsocket_protocols protocols[] = {
 	{
 		NULL, NULL, 0		/* End of list */
 	}
+};
+
+static const struct lws_extension exts[] = {
+	{
+		"permessage-deflate",
+		lws_extension_callback_pm_deflate,
+		"permessage-deflate; client_no_context_takeover; client_max_window_bits"
+	},
+	{
+		"deflate-frame",
+		lws_extension_callback_pm_deflate,
+		"deflate_frame"
+	},
+	{ NULL, NULL, NULL /* terminator */ }
 };
 
 static struct option options[] = {
@@ -258,20 +267,18 @@ int main(int argc, char **argv)
 	int n = 0;
 	int port = 7681;
 	int use_ssl = 0;
-	struct libwebsocket_context *context;
+	struct lws_context *context;
 	int opts = 0;
-	char interface_name[128] = "";
+	char interface_name[128] = "", ads_port[300];
 	const char *iface = NULL;
-	struct libwebsocket *wsi;
-	const char *address;
+	struct lws *wsi;
+	const char *address = NULL;
 	int server_port = port;
 	struct lws_context_creation_info info;
 
 	memset(&info, 0, sizeof info);
-
-	fprintf(stderr, "libwebsockets test fraggle\n"
-			"(C) Copyright 2010-2015 Andy Green <andy@warmcat.com> "
-						    "licensed under LGPL2.1\n");
+	lwsl_notice("libwebsockets test server fraggle - license LGPL2.1+SLE\n");
+	lwsl_notice("(C) Copyright 2010-2016 Andy Green <andy@warmcat.com>\n");
 
 	while (n >= 0) {
 		n = getopt_long(argc, argv, "ci:hsp:d:", options, NULL);
@@ -317,30 +324,46 @@ int main(int argc, char **argv)
 	info.port = server_port;
 	info.iface = iface;
 	info.protocols = protocols;
-#ifndef LWS_NO_EXTENSIONS
-	info.extensions = libwebsocket_get_internal_extensions();
-#endif
+	info.extensions = exts;
+
 	if (use_ssl) {
-		info.ssl_cert_filepath = LOCAL_RESOURCE_PATH"/libwebsockets-test-server.pem";
-		info.ssl_private_key_filepath = LOCAL_RESOURCE_PATH"/libwebsockets-test-server.key.pem";
+		info.ssl_cert_filepath = LOCAL_RESOURCE_PATH
+				"/libwebsockets-test-server.pem";
+		info.ssl_private_key_filepath = LOCAL_RESOURCE_PATH
+				"/libwebsockets-test-server.key.pem";
 	}
 	info.gid = -1;
 	info.uid = -1;
 	info.options = opts;
 
-	context = libwebsocket_create_context(&info);
+	if (use_ssl)
+		info.options |= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+
+	context = lws_create_context(&info);
 	if (context == NULL) {
 		fprintf(stderr, "libwebsocket init failed\n");
 		return -1;
 	}
 
 	if (client) {
+		struct lws_client_connect_info i;
+
 		address = argv[optind];
-		fprintf(stderr, "Connecting to %s:%u\n", address, port);
-		wsi = libwebsocket_client_connect(context, address,
-						   port, use_ssl, "/", address,
-				 "origin", protocols[PROTOCOL_FRAGGLE].name,
-								  -1);
+		snprintf(ads_port, sizeof(ads_port), "%s:%u",
+			 address, port & 65535);
+		memset(&i, 0, sizeof(i));
+		i.context = context;
+		i.address = address;
+		i.port = port;
+		i.ssl_connection = use_ssl;
+		i.path = "/";
+		i.host = ads_port;
+		i.origin = ads_port;
+		i.protocol = protocols[PROTOCOL_FRAGGLE].name;
+		i.client_exts = exts;
+
+		lwsl_notice("Connecting to %s:%u\n", address, port);
+		wsi = lws_client_connect_via_info(&i);
 		if (wsi == NULL) {
 			fprintf(stderr, "Client connect to server failed\n");
 			goto bail;
@@ -349,12 +372,12 @@ int main(int argc, char **argv)
 
 	n = 0;
 	while (!n && !terminate)
-		n = libwebsocket_service(context, 50);
+		n = lws_service(context, 50);
 
 	fprintf(stderr, "Terminating...\n");
 
 bail:
-	libwebsocket_context_destroy(context);
+	lws_context_destroy(context);
 
 	return 0;
 }

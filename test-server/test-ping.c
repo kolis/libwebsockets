@@ -1,22 +1,21 @@
 /*
- * libwebsockets-test-ping - libwebsockets floodping
+ * libwebsockets-test-ping - libwebsockets test floodping
  *
- * Copyright (C) 2011 Andy Green <andy@warmcat.com>
+ * Copyright (C) 2011-2016 Andy Green <andy@warmcat.com>
  *
- *  This library is free software; you can redistribute it and/or
- *  modify it under the terms of the GNU Lesser General Public
- *  License as published by the Free Software Foundation:
- *  version 2.1 of the License.
+ * This file is made available under the Creative Commons CC0 1.0
+ * Universal Public Domain Dedication.
  *
- *  This library is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- *  Lesser General Public License for more details.
+ * The person who associated a work with this deed has dedicated
+ * the work to the public domain by waiving all of his or her rights
+ * to the work worldwide under copyright law, including all related
+ * and neighboring rights, to the extent allowed by law. You can copy,
+ * modify, distribute and perform the work, even for commercial purposes,
+ * all without asking permission.
  *
- *  You should have received a copy of the GNU Lesser General Public
- *  License along with this library; if not, write to the Free Software
- *  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
- *  MA  02110-1301  USA
+ * The test apps are intended to be adapted for use in your code, which
+ * may be proprietary.  So unlike the library itself, they are licensed
+ * Public Domain.
  */
 
 #include <stdio.h>
@@ -26,6 +25,8 @@
 #include <signal.h>
 #include <sys/types.h>
 
+#include "../lib/libwebsockets.h"
+
 #ifndef _WIN32
 #include <netdb.h>
 #include <sys/socket.h>
@@ -33,11 +34,13 @@
 #include <sys/ioctl.h>
 #include <poll.h>
 #include <unistd.h>
+#else
+#include "gettimeofday.h"
 #endif
 
-#include "lws_config.h"
-
-#include "../lib/libwebsockets.h"
+#ifdef __ANDROID__
+#include <termiosh>
+#endif
 
 /*
  * this is specified in the 04 standard, control frames can only have small
@@ -48,13 +51,12 @@
 #define MAX_PING_CLIENTS 256
 #define PING_RINGBUFFER_SIZE 256
 
-static struct libwebsocket *ping_wsi[MAX_PING_CLIENTS];
+static struct lws *ping_wsi[MAX_PING_CLIENTS];
 static unsigned int interval_us = 1000000;
 static unsigned int size = 64;
 static int flood;
 static const char *address;
-static unsigned char pingbuf[LWS_SEND_BUFFER_PRE_PADDING + MAX_MIRROR_PAYLOAD +
-						  LWS_SEND_BUFFER_POST_PADDING];
+static unsigned char pingbuf[LWS_PRE + MAX_MIRROR_PAYLOAD];
 static char peer_name[128];
 static unsigned long started;
 static int screen_width = 80;
@@ -100,29 +102,26 @@ enum demo_protocols {
 
 
 static int
-callback_lws_mirror(struct libwebsocket_context * this,
-			struct libwebsocket *wsi,
-			enum libwebsocket_callback_reasons reason,
-					       void *user, void *in, size_t len)
+callback_lws_mirror(struct lws *wsi, enum lws_callback_reasons reason,
+		    void *user, void *in, size_t len)
 {
+	struct per_session_data__ping *psd = user;
 	struct timeval tv;
 	unsigned char *p;
-	int shift;
-	uint64_t l;
 	unsigned long iv;
-	int n;
 	int match = 0;
-	struct per_session_data__ping *psd = user;
+	uint64_t l;
+	int shift;
+	int n;
 
 	switch (reason) {
 	case LWS_CALLBACK_CLOSED:
-
 		fprintf(stderr, "LWS_CALLBACK_CLOSED on %p\n", (void *)wsi);
 
 		/* remove closed guy */
-	
+
 		for (n = 0; n < clients; n++)
-			if (ping_wsi[n] == wsi) {				
+			if (ping_wsi[n] == wsi) {
 				clients--;
 				while (n < clients) {
 					ping_wsi[n] = ping_wsi[n + 1];
@@ -144,7 +143,7 @@ callback_lws_mirror(struct libwebsocket_context * this,
 		 * LWS_CALLBACK_CLIENT_WRITEABLE will come next service
 		 */
 
-		libwebsocket_callback_on_writable(this, wsi);
+		lws_callback_on_writable(wsi);
 		break;
 
 	case LWS_CALLBACK_CLIENT_RECEIVE:
@@ -220,23 +219,23 @@ callback_lws_mirror(struct libwebsocket_context * this,
 	case LWS_CALLBACK_CLIENT_WRITEABLE:
 
 		shift = 56;
-		p = &pingbuf[LWS_SEND_BUFFER_PRE_PADDING];
+		p = &pingbuf[LWS_PRE];
 
 		/* 64-bit ping index in network byte order */
 
 		while (shift >= 0) {
-			*p++ = psd->ping_index >> shift;
+			*p++ = (unsigned char)(psd->ping_index >> shift);
 			shift -= 8;
 		}
 
-		while (p - &pingbuf[LWS_SEND_BUFFER_PRE_PADDING] < size)
+		while ((unsigned int)(p - &pingbuf[LWS_PRE]) < size)
 			*p++ = 0;
 
 		gettimeofday(&tv, NULL);
 
 		psd->ringbuffer[psd->ringbuffer_head].issue_timestamp =
 					     (tv.tv_sec * 1000000) + tv.tv_usec;
-		psd->ringbuffer[psd->ringbuffer_head].index = psd->ping_index++;
+		psd->ringbuffer[psd->ringbuffer_head].index = (unsigned long)psd->ping_index++;
 		psd->ringbuffer[psd->ringbuffer_head].seen = 0;
 
 		if (psd->ringbuffer_head == PING_RINGBUFFER_SIZE - 1)
@@ -256,17 +255,17 @@ callback_lws_mirror(struct libwebsocket_context * this,
 		global_tx_count++;
 
 		if (use_mirror)
-			n = libwebsocket_write(wsi,
-				&pingbuf[LWS_SEND_BUFFER_PRE_PADDING],
+			n = lws_write(wsi,
+				&pingbuf[LWS_PRE],
 					size, write_options | LWS_WRITE_BINARY);
 		else
-			n = libwebsocket_write(wsi,
-				&pingbuf[LWS_SEND_BUFFER_PRE_PADDING],
+			n = lws_write(wsi,
+				&pingbuf[LWS_PRE],
 					size, write_options | LWS_WRITE_PING);
 
 		if (n < 0)
 			return -1;
-		if (n < size) {
+		if (n < (int)size) {
 			lwsl_err("Partial write\n");
 			return -1;
 		}
@@ -286,16 +285,30 @@ callback_lws_mirror(struct libwebsocket_context * this,
 
 /* list of supported protocols and callbacks */
 
-static struct libwebsocket_protocols protocols[] = {
+static struct lws_protocols protocols[] = {
 
 	{
 		"lws-mirror-protocol",
 		callback_lws_mirror,
 		sizeof (struct per_session_data__ping),
 	},
-	{ 
-		NULL, NULL, 0/* end of list */		
+	{
+		NULL, NULL, 0/* end of list */
 	}
+};
+
+static const struct lws_extension exts[] = {
+	{
+		"permessage-deflate",
+		lws_extension_callback_pm_deflate,
+		"permessage-deflate; client_no_context_takeover; client_max_window_bits"
+	},
+	{
+		"deflate-frame",
+		lws_extension_callback_pm_deflate,
+		"deflate_frame"
+	},
+	{ NULL, NULL, NULL /* terminator */ }
 };
 
 static struct option options[] = {
@@ -314,7 +327,7 @@ static struct option options[] = {
 	{ NULL, 0, 0, 0 }
 };
 
-#ifndef WIN32
+#ifndef _WIN32
 static void
 signal_handler(int sig, siginfo_t *si, void *v)
 {
@@ -330,10 +343,10 @@ int main(int argc, char **argv)
 	int n = 0;
 	int port = 7681;
 	int use_ssl = 0;
-	struct libwebsocket_context *context;
-	char protocol_name[256];
+	struct lws_context *context;
+	char protocol_name[256], ads_port[300];
 	char ip[30];
-#ifndef WIN32
+#ifndef _WIN32
 	struct sigaction sa;
 	struct winsize w;
 #endif
@@ -342,14 +355,12 @@ int main(int argc, char **argv)
 	unsigned long l;
 	int ietf_version = -1;
 	struct lws_context_creation_info info;
+	struct lws_client_connect_info i;
 
 	memset(&info, 0, sizeof info);
 
 	if (argc < 2)
 		goto usage;
-
-	address = argv[1];
-	optind++;
 
 	while (n >= 0) {
 		n = getopt_long(argc, argv, "v:kr:hmfts:n:i:p:d:", options, NULL);
@@ -374,7 +385,7 @@ int main(int argc, char **argv)
 			protocols[PROTOCOL_LWS_MIRROR].name = protocol_name;
 			break;
 		case 'i':
-			interval_us = 1000000.0 * atof(optarg);
+			interval_us = (unsigned int)(1000000.0 * atof(optarg));
 			break;
 		case 's':
 			size = atoi(optarg);
@@ -416,7 +427,7 @@ int main(int argc, char **argv)
 		}
 	}
 
-#ifndef WIN32
+#ifndef _WIN32
 	if (isatty(STDOUT_FILENO))
 		if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) != -1)
 			if (w.ws_col > 0)
@@ -425,13 +436,15 @@ int main(int argc, char **argv)
 
 	info.port = CONTEXT_PORT_NO_LISTEN;
 	info.protocols = protocols;
-#ifndef LWS_NO_EXTENSIONS
-	info.extensions = libwebsocket_get_internal_extensions();
-#endif
+	info.extensions = exts;
+
 	info.gid = -1;
 	info.uid = -1;
 
-	context = libwebsocket_create_context(&info);
+	if (use_ssl)
+		info.options |= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+
+	context = lws_create_context(&info);
 	if (context == NULL) {
 		fprintf(stderr, "Creating libwebsocket context failed\n");
 		return 1;
@@ -439,26 +452,39 @@ int main(int argc, char **argv)
 
 	/* create client websockets using dumb increment protocol */
 
+	address = argv[optind];
+	snprintf(ads_port, sizeof(ads_port), "%s:%u",
+		 address, port & 65535);
+	lwsl_notice("Connecting to %s...\n", ads_port);
+	memset(&i, 0, sizeof(i));
+	i.context = context;
+	i.address = address;
+	i.port = port;
+	i.ssl_connection = use_ssl;
+	i.path = "/";
+	i.host = ads_port;
+	i.origin = ads_port;
+	i.protocol = protocols[PROTOCOL_LWS_MIRROR].name;
+	i.client_exts = exts;
+	i.ietf_version_or_minus_one = ietf_version;
+
 	for (n = 0; n < clients; n++) {
-		ping_wsi[n] = libwebsocket_client_connect(context, address,
-						   port, use_ssl, "/", address,
-				 "origin", protocols[PROTOCOL_LWS_MIRROR].name,
-								  ietf_version);
+		ping_wsi[n] = lws_client_connect_via_info(&i);
 		if (ping_wsi[n] == NULL) {
-			fprintf(stderr, "client connection %d failed to "
-								"connect\n", n);
+			lwsl_err("client %d failed to connect\n", n);
 			return 1;
 		}
 	}
 
-	libwebsockets_get_peer_addresses(context, ping_wsi[0],
-			libwebsocket_get_socket_fd(ping_wsi[0]),
+	lws_get_peer_addresses(ping_wsi[0], lws_get_socket_fd(ping_wsi[0]),
 				    peer_name, sizeof peer_name, ip, sizeof ip);
 
+	lwsl_notice("libwebsockets test server ping - license LGPL2.1+SLE\n");
+	lwsl_notice("(C) Copyright 2010-2016 Andy Green <andy@warmcat.com>\n");
 	fprintf(stderr, "Websocket PING %s (%s) %d bytes of data.\n",
 							   peer_name, ip, size);
 
-#ifndef WIN32
+#ifndef _WIN32
 	/* set the ^C handler */
 	sa.sa_sigaction = signal_handler;
 	sa.sa_flags = SA_SIGINFO;
@@ -487,23 +513,22 @@ int main(int argc, char **argv)
 		if (!interrupted_time) {
 			if ((l - oldus) > interval_us) {
 				for (n = 0; n < clients; n++)
-					libwebsocket_callback_on_writable(
-							  context, ping_wsi[n]);
+					lws_callback_on_writable(ping_wsi[n]);
 				oldus = l;
 			}
 		} else
 
 			/* allow time for in-flight pongs to come */
-		
+
 			if ((l - interrupted_time) > 250000) {
 				n = -1;
 				continue;
 			}
 
 		if (!interval_us)
-			n = libwebsocket_service(context, 0);
+			n = lws_service(context, 0);
 		else
-			n = libwebsocket_service(context, 1);
+			n = lws_service(context, 1);
 	}
 
 	/* stats */
@@ -523,7 +548,7 @@ int main(int argc, char **argv)
 		((double)global_rx_count * (double)size) /
 				  ((double)(l - started) / 1000000.0) / 1024.0);
 
-	libwebsocket_context_destroy(context);
+	lws_context_destroy(context);
 
 	return 0;
 

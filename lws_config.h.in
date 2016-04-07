@@ -1,4 +1,4 @@
-/* config.h.in.  Generated from configure.ac by autoheader.  */
+/* lws_config.h  Generated from lws_config.h.in  */
 
 #ifndef NDEBUG
 	#ifndef _DEBUG
@@ -6,12 +6,27 @@
 	#endif
 #endif
 
-/* Define to 1 to use CyaSSL as a replacement for OpenSSL. 
+/* Define to 1 to use wolfSSL/CyaSSL as a replacement for OpenSSL.
  * LWS_OPENSSL_SUPPORT needs to be set also for this to work. */
-#cmakedefine USE_CYASSL
+#cmakedefine USE_WOLFSSL
+
+/* Also define to 1 (in addition to USE_WOLFSSL) when using the
+  (older) CyaSSL library */
+#cmakedefine USE_OLD_CYASSL
+
+#cmakedefine LWS_USE_MBEDTLS
+#cmakedefine LWS_USE_POLARSSL
+
+#cmakedefine LWS_WITH_PLUGINS
 
 /* The Libwebsocket version */
 #cmakedefine LWS_LIBRARY_VERSION "${LWS_LIBRARY_VERSION}"
+
+#define LWS_LIBRARY_VERSION_MAJOR ${LWS_LIBRARY_VERSION_MAJOR}
+#define LWS_LIBRARY_VERSION_MINOR ${LWS_LIBRARY_VERSION_MINOR}
+#define LWS_LIBRARY_VERSION_PATCH ${LWS_LIBRARY_VERSION_PATCH}
+/* LWS_LIBRARY_VERSION_NUMBER looks like 1005001 for e.g. version 1.5.1 */
+#define LWS_LIBRARY_VERSION_NUMBER (LWS_LIBRARY_VERSION_MAJOR*1000000)+(LWS_LIBRARY_VERSION_MINOR*1000)+LWS_LIBRARY_VERSION_PATCH
 
 /* The current git commit hash that we're building from */
 #cmakedefine LWS_BUILD_HASH "${LWS_BUILD_HASH}"
@@ -30,6 +45,9 @@
 
 /* Enable libev io loop */
 #cmakedefine LWS_USE_LIBEV
+
+/* Enable libuv io loop */
+#cmakedefine LWS_USE_LIBUV
 
 /* Build with support for ipv6 */
 #cmakedefine LWS_USE_IPV6
@@ -55,119 +73,22 @@
 /* Use the BSD getifaddrs that comes with libwebsocket, for uclibc support */
 #cmakedefine LWS_BUILTIN_GETIFADDRS
 
-/* Define to 1 if you have the `bzero' function. */
-#cmakedefine HAVE_BZERO
+/* use SHA1() not internal libwebsockets_SHA1 */
+#cmakedefine LWS_SHA1_USE_OPENSSL_NAME
 
-/* Define to 1 if you have the <dlfcn.h> header file. */
-#cmakedefine HAVE_DLFCN_H
+/* SSL server using ECDH certificate */
+#cmakedefine LWS_SSL_SERVER_WITH_ECDH_CERT
 
-/* Define to 1 if you have the <fcntl.h> header file. */
-#cmakedefine HAVE_FCNTL_H
+/* CGI apis */
+#cmakedefine LWS_WITH_CGI
 
-/* Define to 1 if you have the `fork' function. */
-#cmakedefine HAVE_FORK
+/* whether the Openssl is recent enough, and / or built with, ecdh */
+#cmakedefine LWS_HAVE_OPENSSL_ECDH_H
 
-/* Define to 1 if you have the `getenv’ function. */
-#cmakedefine HAVE_GETENV
+/* HTTP Proxy support */
+#cmakedefine LWS_WITH_HTTP_PROXY
 
-/* Define to 1 if you have the <in6addr.h> header file. */
-#cmakedefine HAVE_IN6ADDR_H
+/* Maximum supported service threads */
+#define LWS_MAX_SMP ${LWS_MAX_SMP}
 
-/* Define to 1 if you have the <inttypes.h> header file. */
-#cmakedefine HAVE_INTTYPES_H
-
-/* Define to 1 if you have the `ssl' library (-lssl). */
-//#cmakedefine HAVE_LIBSSL
-
-/* Define to 1 if your system has a GNU libc compatible `malloc' function, and
-   to 0 otherwise. */
-#cmakedefine HAVE_MALLOC
-
-/* Define to 1 if you have the <memory.h> header file. */
-#cmakedefine HAVE_MEMORY_H
-
-/* Define to 1 if you have the `memset' function. */
-#cmakedefine HAVE_MEMSET
-
-/* Define to 1 if you have the <netinet/in.h> header file. */
-#cmakedefine HAVE_NETINET_IN_H
-
-/* Define to 1 if your system has a GNU libc compatible `realloc' function,
-   and to 0 otherwise. */
-#cmakedefine HAVE_REALLOC
-
-/* Define to 1 if you have the `socket' function. */
-#cmakedefine HAVE_SOCKET
-
-/* Define to 1 if you have the <stdint.h> header file. */
-#cmakedefine HAVE_STDINT_H
-
-/* Define to 1 if you have the <stdlib.h> header file. */
-#cmakedefine HAVE_STDLIB_H
-
-/* Define to 1 if you have the `strerror' function. */
-#cmakedefine HAVE_STRERROR
-
-/* Define to 1 if you have the <strings.h> header file. */
-#cmakedefine HAVE_STRINGS_H
-
-/* Define to 1 if you have the <string.h> header file. */
-#cmakedefine HAVE_STRING_H
-
-/* Define to 1 if you have the <sys/prctl.h> header file. */
-#cmakedefine HAVE_SYS_PRCTL_H
-
-/* Define to 1 if you have the <sys/socket.h> header file. */
-#cmakedefine HAVE_SYS_SOCKET_H
-
-/* Define to 1 if you have the <sys/stat.h> header file. */
-#cmakedefine HAVE_SYS_STAT_H
-
-/* Define to 1 if you have the <sys/types.h> header file. */
-#cmakedefine HAVE_SYS_TYPES_H
-
-/* Define to 1 if you have the <unistd.h> header file. */
-#cmakedefine HAVE_UNISTD_H
-
-/* Define to 1 if you have the `vfork' function. */
-#cmakedefine HAVE_VFORK
-
-/* Define to 1 if you have the <vfork.h> header file. */
-#cmakedefine HAVE_VFORK_H
-
-/* Define to 1 if `fork' works. */
-#cmakedefine HAVE_WORKING_FORK
-
-/* Define to 1 if `vfork' works. */
-#cmakedefine HAVE_WORKING_VFORK
-
-/* Define to 1 if you have the <zlib.h> header file. */
-#cmakedefine HAVE_ZLIB_H
-
-/* Define to the sub-directory in which libtool stores uninstalled libraries.
-   */
-#undef LT_OBJDIR // We're not using libtool
-
-/* Version number of package */
-#cmakedefine VERSION
-
-/* Define to rpl_malloc if the replacement function should be used. */
-#cmakedefine malloc
-
-/* Define to `int' if <sys/types.h> does not define. */
-#cmakedefine pid_t
-
-/* Define to rpl_realloc if the replacement function should be used. */
-#cmakedefine realloc
-
-/* Define to `unsigned int' if <sys/types.h> does not define. */
-#cmakedefine size_t
-
-/* Define to 1 if we have getifaddrs */
-#cmakedefine HAVE_GETIFADDRS
-
-/* Define as `fork' if `vfork' does not work. */
-//#cmakedefine vfork
-
-/* Define if the inline keyword doesn't exist. */
-#cmakedefine inline ${inline}
+${LWS_SIZEOFPTR_CODE}

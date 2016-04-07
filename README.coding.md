@@ -44,6 +44,12 @@ websocket ones, you can combine them together with the websocket ones
 in one poll loop, see "External Polling Loop support" below, and
 still do it all in one thread / process context.
 
+If you insist on trying to use it from multiple threads, take special care if
+you might simultaneously create more than one context from different threads.
+
+SSL_library_init() is called from the context create api and it also is not
+reentrant.  So at least create the contexts sequentially.
+
 
 Only send data when socket writeable
 ------------------------------------
@@ -55,8 +61,8 @@ clients).
 If you want to send something, do not just send it but request a callback
 when the socket is writeable using
 
- - `libwebsocket_callback_on_writable(context, wsi)`` for a specific `wsi`, or
- - `libwebsocket_callback_on_writable_all_protocol(protocol)` for all connections
+ - `lws_callback_on_writable(context, wsi)`` for a specific `wsi`, or
+ - `lws_callback_on_writable_all_protocol(protocol)` for all connections
 using that protocol to get a callback when next writeable.
 
 Usually you will get called back immediately next time around the service
@@ -87,7 +93,7 @@ Closing connections from the user side
 When you want to close a connection, you do it by returning `-1` from a
 callback for that connection.
 
-You can provoke a callback by calling `libwebsocket_callback_on_writable` on
+You can provoke a callback by calling `lws_callback_on_writable` on
 the wsi, then notice in the callback you want to close it and just return -1.
 But usually, the decision to close is made in a callback already and returning
 -1 is simple.
@@ -106,7 +112,7 @@ Fragmented messages
 -------------------
 
 To support fragmented messages you need to check for the final
-frame of a message with `libwebsocket_is_final_fragment`. This
+frame of a message with `lws_is_final_fragment`. This
 check can be combined with `libwebsockets_remaining_packet_payload`
 to gather the whole contents of a message, eg:
 
@@ -114,9 +120,9 @@ to gather the whole contents of a message, eg:
     case LWS_CALLBACK_RECEIVE:
     {
         Client * const client = (Client *)user;
-        const size_t remaining = libwebsockets_remaining_packet_payload(wsi);
+        const size_t remaining = lws_remaining_packet_payload(wsi);
 
-        if (!remaining && libwebsocket_is_final_fragment(wsi)) {
+        if (!remaining && lws_is_final_fragment(wsi)) {
             if (client->HasFragments()) {
                 client->AppendMessageFragment(in, len, 0);
                 in = (void *)client->GetMessage();
@@ -172,7 +178,7 @@ Four callbacks `LWS_CALLBACK_ADD_POLL_FD`, `LWS_CALLBACK_DEL_POLL_FD`,
 appear in the callback for protocol 0 and allow interface code to
 manage socket descriptors in other poll loops.
 
-You can pass all pollfds that need service to `libwebsocket_service_fd()`, even
+You can pass all pollfds that need service to `lws_service_fd()`, even
 if the socket or file does not belong to **libwebsockets** it is safe.
 
 If **libwebsocket** handled it, it zeros the pollfd `revents` field before returning.
@@ -255,8 +261,8 @@ if left `NULL`, then the "DEFAULT" set of ciphers are all possible to select.
 Async nature of client connections
 ----------------------------------
 
-When you call `libwebsocket_client_connect(..)` and get a `wsi` back, it does not
-mean your connection is active.  It just mean it started trying to connect.
+When you call `lws_client_connect_info(..)` and get a `wsi` back, it does not
+mean your connection is active.  It just means it started trying to connect.
 
 Your client connection is actually active only when you receive
 `LWS_CALLBACK_CLIENT_ESTABLISHED` for it.
@@ -267,6 +273,124 @@ other reasons, if any of that happens you'll get a
 `wsi`.
 
 After attempting the connection and getting back a non-`NULL` `wsi` you should
-loop calling `libwebsocket_service()` until one of the above callbacks occurs.
+loop calling `lws_service()` until one of the above callbacks occurs.
 
 As usual, see [test-client.c](test-server/test-client.c) for example code.
+
+Lws platform-independent file access apis
+-----------------------------------------
+
+lws now exposes his internal platform file abstraction in a way that can be
+both used by user code to make it platform-agnostic, and be overridden or
+subclassed by user code.  This allows things like handling the URI "directory
+space" as a virtual filesystem that may or may not be backed by a regular
+filesystem.  One example use is serving files from inside large compressed
+archive storage without having to unpack anything except the file being
+requested.
+
+The test server shows how to use it, basically the platform-specific part of
+lws prepares a file operations structure that lives in the lws context.
+
+The user code can get a pointer to the file operations struct
+
+LWS_VISIBLE LWS_EXTERN struct lws_plat_file_ops *
+`lws_get_fops`(struct lws_context *context);
+
+and then can use helpers to also leverage these platform-independent
+file handling apis
+
+static inline lws_filefd_type
+`lws_plat_file_open`(struct lws *wsi, const char *filename, unsigned long *filelen, int flags)
+
+static inline int
+`lws_plat_file_close`(struct lws *wsi, lws_filefd_type fd)
+
+static inline unsigned long
+`lws_plat_file_seek_cur`(struct lws *wsi, lws_filefd_type fd, long offset_from_cur_pos)
+
+static inline int
+`lws_plat_file_read`(struct lws *wsi, lws_filefd_type fd, unsigned long *amount, unsigned char *buf, unsigned long len)
+
+static inline int
+`lws_plat_file_write`(struct lws *wsi, lws_filefd_type fd, unsigned long *amount, unsigned char *buf, unsigned long len)
+		    
+The user code can also override or subclass the file operations, to either
+wrap or replace them.  An example is shown in test server.
+
+ECDH Support
+------------
+
+ECDH Certs are now supported.  Enable the CMake option
+
+cmake .. -DLWS_SSL_SERVER_WITH_ECDH_CERT=1 
+
+**and** the info->options flag
+
+LWS_SERVER_OPTION_SSL_ECDH
+
+to build in support and select it at runtime.
+
+SMP / Multithreaded service
+---------------------------
+
+SMP support is integrated into LWS without any internal threading.  It's
+very simple to use, libwebsockets-test-server-pthread shows how to do it,
+use -j <n> argument there to control the number of service threads up to 32.
+
+Two new members are added to the info struct
+
+	unsigned int count_threads;
+	unsigned int fd_limit_per_thread;
+	
+leave them at the default 0 to get the normal singlethreaded service loop.
+
+Set count_threads to n to tell lws you will have n simultaneous service threads
+operating on the context.
+
+There is still a single listen socket on one port, no matter how many
+service threads.
+
+When a connection is made, it is accepted by the service thread with the least
+connections active to perform load balancing.
+
+The user code is responsible for spawning n threads running the service loop
+associated to a specific tsi (Thread Service Index, 0 .. n - 1).  See
+the libwebsockets-test-server-pthread for how to do.
+
+If you leave fd_limit_per_thread at 0, then the process limit of fds is shared
+between the service threads; if you process was allowed 1024 fds overall then
+each thread is limited to 1024 / n.
+
+You can set fd_limit_per_thread to a nonzero number to control this manually, eg
+the overall supported fd limit is less than the process allowance.
+
+You can control the context basic data allocation for multithreading from Cmake
+using -DLWS_MAX_SMP=, if not given it's set to 32.  The serv_buf allocation
+for the threads (currently 4096) is made at runtime only for active threads.
+
+Because lws will limit the requested number of actual threads supported
+according to LWS_MAX_SMP, there is an api lws_get_count_threads(context) to
+discover how many threads were actually allowed when the context was created.
+
+It's required to implement locking in the user code in the same way that
+libwebsockets-test-server-pthread does it, for the FD locking callbacks.
+
+There is no knowledge or dependency in lws itself about pthreads.  How the
+locking is implemented is entirely up to the user code.
+
+
+Libev / Libuv support
+---------------------
+
+You can select either or both
+
+-DLWS_WITH_LIBEV=1
+-DLWS_WITH_LIBUV=1
+
+at cmake configure-time.  The user application may use one of the
+context init options flags
+
+LWS_SERVER_OPTION_LIBEV
+LWS_SERVER_OPTION_LIBUV
+
+to indicate it will use either of the event libraries.

@@ -17,12 +17,12 @@
  *  License along with this library; if not, write to the Free Software
  *  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
  *  MA  02110-1301  USA
- * 
+ *
  * Some or all of this file is based on code from nghttp2, which has the
  * following license.  Since it's more liberal than lws license, you're also
  * at liberty to get the original code from
  * https://github.com/tatsuhiro-t/nghttp2 under his liberal terms alone.
- * 
+ *
  * nghttp2 - HTTP/2.0 C Library
  *
  * Copyright (c) 2012 Tatsuhiro Tsujikawa
@@ -59,7 +59,8 @@ struct alpn_ctx {
 	unsigned short len;
 };
 
-static int npn_cb(SSL *s, const unsigned char **data, unsigned int *len, void *arg)
+static int
+npn_cb(SSL *s, const unsigned char **data, unsigned int *len, void *arg)
 {
 	struct alpn_ctx *alpn_ctx = arg;
 
@@ -70,15 +71,15 @@ static int npn_cb(SSL *s, const unsigned char **data, unsigned int *len, void *a
 	return SSL_TLSEXT_ERR_OK;
 }
 
-static int alpn_cb(SSL *s, const unsigned char **out,
-		unsigned char *outlen, const unsigned char *in,
-		unsigned int inlen, void *arg)
+static int
+alpn_cb(SSL *s, const unsigned char **out, unsigned char *outlen,
+	const unsigned char *in, unsigned int inlen, void *arg)
 {
 	struct alpn_ctx *alpn_ctx = arg;
 
-	if (SSL_select_next_proto((unsigned char **)out, outlen,
-				  alpn_ctx->data, alpn_ctx->len, in, inlen) !=
-							OPENSSL_NPN_NEGOTIATED)
+	if (SSL_select_next_proto((unsigned char **)out, outlen, alpn_ctx->data,
+				  alpn_ctx->len, in, inlen) !=
+	    OPENSSL_NPN_NEGOTIATED)
 		return SSL_TLSEXT_ERR_NOACK;
 
 	return SSL_TLSEXT_ERR_OK;
@@ -86,16 +87,14 @@ static int alpn_cb(SSL *s, const unsigned char **out,
 #endif
 
 LWS_VISIBLE void
-lws_context_init_http2_ssl(struct libwebsocket_context *context)
+lws_context_init_http2_ssl(struct lws_context *context)
 {
 #if OPENSSL_VERSION_NUMBER >= 0x10002000L
-	static struct alpn_ctx protos = { (unsigned char *)
-						"\x05h2-14"
-						"\x08http/1.1",
-						6 + 9 };
+	static struct alpn_ctx protos = { (unsigned char *)"\x05h2-14"
+					  "\x08http/1.1", 6 + 9 };
 
 	SSL_CTX_set_next_protos_advertised_cb(context->ssl_ctx, npn_cb, &protos);
-	
+
 	// ALPN selection callback
 	SSL_CTX_set_alpn_select_cb(context->ssl_ctx, alpn_cb, &protos);
 	lwsl_notice(" HTTP2 / ALPN enabled\n");
@@ -106,43 +105,44 @@ lws_context_init_http2_ssl(struct libwebsocket_context *context)
 #endif // OPENSSL_VERSION_NUMBER >= 0x10002000L
 }
 
-void lws_http2_configure_if_upgraded(struct libwebsocket *wsi)
+void lws_http2_configure_if_upgraded(struct lws *wsi)
 {
 #if OPENSSL_VERSION_NUMBER >= 0x10002000L
 	struct allocated_headers *ah;
+	const char *method = "alpn";
 	const unsigned char *name;
 	unsigned len;
-	const char *method = "alpn";
 
 	SSL_get0_alpn_selected(wsi->ssl, &name, &len);
-	
+
 	if (!len) {
 		SSL_get0_next_proto_negotiated(wsi->ssl, &name, &len);
 		method = "npn";
 	}
-	
+
 	if (!len) {
 		lwsl_info("no npn/alpn upgrade\n");
 		return;
 	}
 
+	(void)method;
 	lwsl_info("negotiated %s using %s\n", name, method);
 	wsi->use_ssl = 1;
 	if (strncmp((char *)name, "http/1.1", 8) == 0)
 		return;
-		
+
 	/* http2 */
 
 	/* adopt the header info */
 
 	ah = wsi->u.hdr.ah;
 
-	lws_union_transition(wsi, LWS_CONNMODE_HTTP2_SERVING);
-	wsi->state = WSI_STATE_HTTP2_AWAIT_CLIENT_PREFACE;
-		
+	lws_union_transition(wsi, LWSCM_HTTP2_SERVING);
+	wsi->state = LWSS_HTTP2_AWAIT_CLIENT_PREFACE;
+
 	/* http2 union member has http union struct at start */
 	wsi->u.http.ah = ah;
-		
+
 	lws_http2_init(&wsi->u.http2.peer_settings);
 	lws_http2_init(&wsi->u.http2.my_settings);
 
