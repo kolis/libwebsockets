@@ -231,8 +231,8 @@ lws_ssl_client_connect2(struct lws *wsi)
 		     n == X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN) && wsi->use_ssl == 2) {
 			lwsl_notice("accepting self-signed certificate\n");
 		} else {
-			lwsl_err("server's cert didn't look good, X509_V_ERR = %d: %s\n",
-				 n, ERR_error_string(n, sb));
+			lwsl_err("server's cert didn't look good, X509_V_ERR = %d: %s, x509: %s\n",
+				 n, ERR_error_string(n, sb),  X509_verify_cert_error_string(n));
 			lws_close_free_wsi(wsi,
 				LWS_CLOSE_STATUS_NOSTATUS);
 			return 0;
@@ -263,8 +263,9 @@ int lws_context_init_client_ssl(struct lws_context_creation_info *info,
 		return 0;
 	}
 
-	if (info->port != CONTEXT_PORT_NO_LISTEN)
-		return 0;
+	// Modified by Nils, we need to be able to have a server which can also act as an SSL client
+	// if (info->port != CONTEXT_PORT_NO_LISTEN)
+	// 	return 0;
 
 	/* basic openssl init */
 
